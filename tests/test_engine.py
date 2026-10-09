@@ -239,16 +239,17 @@ def test_sl_hit_while_bot_down_is_reported_on_restart(tmp_path):
 # --------------------------------------------------------------- risk/modes
 
 def test_risk_limits_block_new_trades():
-    eng, broker, _ = make(limits=RiskLimits(max_lot=0.05, max_open_trades=1, max_spread_pips=10))
+    eng, broker, _ = make(limits=RiskLimits(max_lot=0.05, max_spread_pips=10))
     with pytest.raises(TradeError, match="max lot"):
         eng.open_trade(Side.BUY, TradeSettings(lot=0.06))
     broker.spread = 1.50
     with pytest.raises(TradeError, match="Spread is 15 pips"):
         eng.open_trade(Side.BUY, TradeSettings())
     broker.spread = 0.30
-    eng.open_trade(Side.BUY, TradeSettings())
-    with pytest.raises(TradeError, match="trades open"):
+    # No cap on the number of open trades.
+    for _ in range(4):
         eng.open_trade(Side.BUY, TradeSettings())
+    assert len(eng.store.open_trades()) == 4
 
 
 def test_market_closed_blocks_trades():
@@ -307,3 +308,22 @@ def test_preview_shows_prices_and_dollars():
     p = eng.preview(Side.BUY, TradeSettings())
     assert p["sl"] == {"price": 2645.30, "usd": -20.0}
     assert p["steps"][0] == {"price": 2652.30, "close_volume": 0.02, "usd": 4.0}
+
+
+def test_retry_does_not_reclose_when_broker_filled_but_said_no():
+    """Capital.com reports some filled partial closes as failures. A retry must notice the
+    position already shrank instead of closing another slice."""
+    eng, broker, clock = make()
+    trade, _ = eng.open_trade(Side.BUY, TradeSettings())          # 0.04, P1 closes 0.02
+    broker.fail("close", message="Done (retcode 0)")
+    broker.set_price(2652.30)                                      # +20 pips -> P1
+    assert eng.tick() == []                                        # reported failure, retry scheduled
+    assert trade.steps[0].attempts == 1
+    # The broker had actually filled it.
+    broker._fill_close(broker._positions[trade.ticket], 0.02, 2652.30, "bot")
+    clock.t += 10
+    ev = eng.tick()
+    assert broker.position(trade.ticket).volume == 0.02            # not closed again
+    assert trade.steps[0].status is StepStatus.HIT and trade.steps[0].closed_volume == 0.02
+    assert "P1 hit: closed 0.02" in ev[0].message
+    assert len(broker.closing_deals(trade.ticket)) == 1

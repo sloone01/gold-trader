@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import itertools
 
-from .broker import Deal, OrderResult, Position, Quote, SymbolInfo
+from .broker import AccountInfo, Deal, OrderResult, Position, Quote, SymbolInfo
 from .models import Side
 
 TRADE_RETCODE_REQUOTE = 10004
@@ -28,6 +28,7 @@ class SimBroker:
         self._ids = itertools.count(1001)
         self.fail_next: list[tuple[str, int, str]] = []  # (call name, retcode, message)
         self.calls: list[tuple] = []
+        self.start_balance = 10_000.0
 
     # -- test controls
 
@@ -63,6 +64,16 @@ class SimBroker:
 
     def symbol_info(self) -> SymbolInfo:
         return self.info
+
+    def account(self) -> AccountInfo:
+        closed = sum(d.profit for ds in self._deals.values() for d in ds)
+        floating = 0.0
+        for p in self._positions.values():
+            px = self.bid if p.side is Side.BUY else self.ask
+            floating += (px - p.price_open) * p.side.sign * p.volume * self.info.contract_size
+        balance = round(self.start_balance + closed, 2)
+        return AccountInfo(login=0, server="Simulator", currency="USD", balance=balance,
+                           equity=round(balance + floating, 2), margin_free=round(balance + floating, 2))
 
     def quote(self) -> Quote | None:
         return Quote(self.bid, self.ask, self.time)

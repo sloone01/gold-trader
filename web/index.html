@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Gold Trader</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="stylesheet" href="styles.css?v=3">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand"><span class="dot" id="conn-dot"></span> <b>Gold Trader</b> <span id="sym" class="muted"></span></div>
+  <div class="quote" id="quote">—</div>
+</header>
+
+<main id="view"></main>
+
+<nav id="tabs">
+  <a href="#/" data-tab="home"><span class="ico">◉</span>Home</a>
+  <a href="#/trade" data-tab="trade"><span class="ico">＋</span>Trade</a>
+  <a href="#/signals" data-tab="signals"><span class="ico">⚡</span>Signals</a>
+  <a href="#/history" data-tab="history"><span class="ico">≡</span>History</a>
+  <a href="#/settings" data-tab="settings"><span class="ico">⚙</span>Settings</a>
+</nav>
+
+<div id="toasts"></div>
+
+<div id="login" class="modal hidden">
+  <form class="card" id="login-form">
+    <h2>Connect to your bot</h2>
+    <p class="muted">Enter the access token you set as <code>GT_TOKEN</code> on the VPS.</p>
+    <label>Access token<input type="password" id="login-token" autocomplete="current-password" required></label>
+    <button class="primary" type="submit">Connect</button>
+    <p class="error" id="login-error"></p>
+  </form>
+</div>
+
+<script src="app.js?v=10"></script>
+</body>
+</html>

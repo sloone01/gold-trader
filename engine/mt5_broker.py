@@ -8,7 +8,7 @@ import time
 
 import MetaTrader5 as mt5
 
-from .broker import Deal, OrderResult, Position, Quote, SymbolInfo
+from .broker import AccountInfo, Deal, OrderResult, Position, Quote, SymbolInfo
 from .models import Side
 
 MAGIC = 260210          # tags this bot's orders so they're easy to find in MT5
@@ -57,6 +57,14 @@ class MT5Broker:
             contract_size=s.trade_contract_size,
         )
 
+    def account(self) -> AccountInfo:
+        a = mt5.account_info()
+        term = mt5.terminal_info()
+        if a is None:
+            return AccountInfo(0, "", "USD", 0.0, 0.0, 0.0, connected=False)
+        return AccountInfo(a.login, a.server, a.currency, a.balance, a.equity, a.margin_free,
+                           connected=bool(term and term.connected))
+
     def quote(self) -> Quote | None:
         t = mt5.symbol_info_tick(self.symbol)
         return None if t is None or t.bid == 0 else Quote(t.bid, t.ask, t.time_msc / 1000)
@@ -82,11 +90,12 @@ class MT5Broker:
         r = self._send(req)
         # In MT5 the position ticket equals the ticket of the order that opened it.
         if r.ok and not r.price:
-            p = self.position(r.ticket)
+            p = self._wait_position(r.ticket)
             r.price = p.price_open if p else req["price"]
         return r
 
     def close(self, ticket: int, side: Side, volume: float) -> OrderResult:
+        before = self.position(ticket)
         t = mt5.symbol_info_tick(self.symbol)
         req = {
             "action": mt5.TRADE_ACTION_DEAL, "symbol": self.symbol, "position": ticket, "volume": float(volume),
@@ -97,6 +106,18 @@ class MT5Broker:
         }
         r = self._send(req)
         r.ticket = ticket
+        if not r.ok and before is not None:
+            # Capital.com sometimes answers a filled close with retcode 0 "Done". Check the position itself.
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                after = self.position(ticket)
+                if after is None or after.volume < before.volume - 1e-9:
+                    r.ok, r.message = True, "done (verified on the terminal)"
+                    break
+                time.sleep(0.1)
+        if r.ok and not r.price:
+            time.sleep(0.2)
+            r.price = self._last_out_price(ticket, req["price"])
         return r
 
     def modify(self, ticket: int, sl: float | None, tp: float | None) -> OrderResult:
@@ -127,14 +148,40 @@ class MT5Broker:
 
     # -- internals
 
+    _OK_CODES = (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED, mt5.TRADE_RETCODE_DONE_PARTIAL)
+
     def _send(self, req: dict) -> OrderResult:
         r = mt5.order_send(req)
         if r is None:
             code, msg = mt5.last_error()
             return OrderResult(False, code, msg)
-        if r.retcode != mt5.TRADE_RETCODE_DONE:
-            return OrderResult(False, r.retcode, r.comment or f"retcode {r.retcode}")
+        ok = r.retcode in self._OK_CODES
+        if not ok and r.order and req["action"] == mt5.TRADE_ACTION_DEAL:
+            # Some brokers (Capital.com) answer with an unexpected code even though the order filled.
+            # Trust the terminal's state over the return code: if a position/deal exists for this order, it went through.
+            if self._wait_position(r.order) or self._order_deals(r.order):
+                ok = True
+        if not ok:
+            return OrderResult(False, r.retcode, f"{r.comment or 'rejected'} (retcode {r.retcode})")
         return OrderResult(True, r.retcode, r.comment, r.order, r.price or None, r.volume)
+
+    def _wait_position(self, ticket: int, timeout: float = 3.0) -> Position | None:
+        """Market orders can be reported before the position shows up; poll briefly."""
+        deadline = time.time() + timeout
+        while True:
+            p = self.position(ticket)
+            if p is not None or time.time() >= deadline:
+                return p
+            time.sleep(0.1)
+
+    @staticmethod
+    def _order_deals(order: int) -> list:
+        return list(mt5.history_deals_get(order=order) or [])
+
+    def _last_out_price(self, ticket: int, fallback: float) -> float:
+        deals = [d for d in (mt5.history_deals_get(position=ticket) or [])
+                 if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY)]
+        return deals[-1].price if deals else fallback
 
     @staticmethod
     def _pos(p) -> Position:

@@ -2,3 +2,10 @@
 __pycache__/
 .pytest_cache/
 state.json
+sim.db*
+gold-trader.db*
+.claude/
+.env
+logs/
+scripts/run_tunnel.bat
+telegram.session*

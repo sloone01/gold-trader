@@ -59,8 +59,20 @@ class Deal:
     time: float
 
 
+@dataclass
+class AccountInfo:
+    login: int
+    server: str
+    currency: str
+    balance: float
+    equity: float
+    margin_free: float
+    connected: bool = True
+
+
 class Broker(Protocol):
     def symbol_info(self) -> SymbolInfo: ...
+    def account(self) -> AccountInfo: ...
     def quote(self) -> Quote | None: ...
     def market_open(self) -> bool: ...
     def open(self, side: Side, volume: float, sl: float | None, tp: float | None, comment: str) -> OrderResult: ...

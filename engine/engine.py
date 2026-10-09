@@ -22,7 +22,6 @@ _EPS = 1e-9
 @dataclass
 class RiskLimits:
     max_lot: float = 0.10
-    max_open_trades: int = 3
     daily_loss_usd: float = 50.0     # block new trades after losing this much today (UTC)
     max_spread_pips: float = 10.0    # block new trades while the spread is wider than this
 
@@ -64,8 +63,6 @@ class Engine:
             errors.append(f"Spread is {spread:.0f} pips, above the {self.limits.max_spread_pips:.0f} pip limit")
         if settings.lot > self.limits.max_lot + _EPS:
             errors.append(f"Lot {settings.lot} is above your max lot {self.limits.max_lot}")
-        if len(self.store.open_trades()) >= self.limits.max_open_trades:
-            errors.append(f"Already {self.limits.max_open_trades} trades open (max)")
         lost = -self.today_result_usd()
         if lost >= self.limits.daily_loss_usd:
             errors.append(f"Daily loss limit reached (${lost:.2f} lost today)")
@@ -114,6 +111,32 @@ class Engine:
                                f"{side.value.capitalize()} {settings.lot} @ {self._fmt(entry)}, {sl_txt} "
                                f"({settings.stop_mode.value.capitalize()})", "View"))
         return trade, events
+
+    def adopt(self, ticket: int, settings: TradeSettings) -> tuple[Trade, list[Event]]:
+        """Take over a position that exists on the broker but isn't tracked (e.g. opened while the
+        bot was down, or reported as rejected by a broker quirk). Steps and trailing apply from now on;
+        the SL/TP already on the position are kept until a step moves them."""
+        existing = self.store.trades.get(ticket)
+        if existing and existing.open:
+            raise TradeError(f"Trade {ticket} is already managed")
+        pos = self.broker.position(ticket)
+        if pos is None:
+            raise TradeError(f"No open position {ticket} on the broker")
+        errors, _ = validate(replace(settings, lot=pos.volume), self.info)
+        if errors:
+            raise TradeError("; ".join(errors))
+        settings = replace(settings, lot=pos.volume)
+        volumes = split_volumes(pos.volume, [s.close_pct for s in settings.steps], self.info.vol_min, self.info.vol_step)
+        trade = Trade(ticket=ticket, side=pos.side, settings=settings, entry=pos.price_open, volume=pos.volume,
+                      sl=pos.sl, tp=pos.tp, steps=[StepState(planned_volume=v) for v in volumes], opened_at=self.clock())
+        self.store.save(trade)
+        return trade, [Event("opened", ticket, f"Adopted {pos.side.value} {pos.volume} @ {self._fmt(pos.price_open)}, "
+                                                f"SL {self._fmt(pos.sl)}", "View")]
+
+    def unmanaged_positions(self) -> list[Position]:
+        """Broker positions this bot opened (or that carry its tag) but isn't tracking."""
+        open_tickets = {t.ticket for t in self.store.open_trades()}
+        return [p for p in self.broker.positions() if p.ticket not in open_tickets]
 
     def reenter(self, ticket: int) -> tuple[Trade, list[Event]]:
         old = self._get(ticket)
@@ -256,7 +279,15 @@ class Engine:
 
         if not st.close_done:
             vol = min(st.planned_volume, pos.volume)
-            if vol + _EPS < self.info.vol_min:
+            expected = round(trade.volume - sum(s.closed_volume for s in trade.steps), 8)
+            already = round(expected - pos.volume, 8)
+            if st.attempts > 0 and already >= min(vol, self.info.vol_min) - _EPS:
+                # A previous attempt was reported as failed but the position did shrink: the broker
+                # filled it. Never send it again, or every retry would close another slice.
+                deals = self.broker.closing_deals(trade.ticket)
+                st.closed_volume = min(already, vol)
+                st.close_price = deals[-1].price if deals else pos.price_open
+            elif vol + _EPS < self.info.vol_min:
                 if st.planned_volume > 0:
                     parts.append("close skipped (below minimum lot)")
             else:
