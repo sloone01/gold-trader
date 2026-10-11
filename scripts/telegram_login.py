@@ -5,7 +5,9 @@
 Reads TG_API_ID / TG_API_HASH / TG_SESSION from .env (or the environment), asks for your phone
 number and the code Telegram sends you, then saves the session file. Restart the server afterwards.
 """
+import asyncio
 import os
+import sys
 from pathlib import Path
 
 
@@ -18,22 +20,49 @@ def load_env() -> None:
                 os.environ.setdefault(k.strip(), v.strip())
 
 
-def main() -> None:
-    load_env()
-    api_id, api_hash = os.environ.get("TG_API_ID"), os.environ.get("TG_API_HASH")
-    if not api_id or not api_hash:
-        raise SystemExit("Set TG_API_ID and TG_API_HASH in .env first (from https://my.telegram.org).")
+async def run() -> None:
     from telethon import TelegramClient
 
     session = os.environ.get("TG_SESSION", "telegram.session")
-    with TelegramClient(session, int(api_id), api_hash) as client:
-        me = client.get_me()
-        print(f"Logged in as {me.first_name} (@{me.username}). Session saved to {session}.")
+    client = TelegramClient(session, int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            phone = input("Phone number with country code (e.g. +9689xxxxxxx): ").strip()
+            await client.send_code_request(phone)
+            code = input("Code Telegram sent to your app: ").strip()
+            try:
+                await client.sign_in(phone, code)
+            except Exception as ex:  # two-step verification password
+                if "password" in str(ex).lower() or type(ex).__name__ == "SessionPasswordNeededError":
+                    pw = input("Two-step verification password: ")
+                    await client.sign_in(password=pw)
+                else:
+                    raise
+        me = await client.get_me()
+        print(f"\nLogged in as {me.first_name} (@{me.username}). Session saved to {session}.")
         print("Channels and groups you are in:")
-        for d in client.iter_dialogs():
+        async for d in client.iter_dialogs():
             if d.is_channel or d.is_group:
                 print(f"  {d.id:>16}  {d.name}")
-        print("Pick the ones to follow in the dashboard (Signals -> Channels). Then restart the server.")
+        print("\nDone. Now restart the server:  powershell -ExecutionPolicy Bypass -File scripts\\restart_server.ps1")
+    finally:
+        await client.disconnect()
+
+
+def main() -> None:
+    load_env()
+    if not os.environ.get("TG_API_ID") or not os.environ.get("TG_API_HASH"):
+        raise SystemExit("Set TG_API_ID and TG_API_HASH in .env first (from https://my.telegram.org).")
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        print("\nCancelled. Run the command again to log in.")
+        return
+    # Telethon's background tasks complain noisily when the loop closes on Python 3.14; nothing is wrong.
+    os._exit(0)
 
 
 if __name__ == "__main__":
