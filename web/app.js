@@ -666,7 +666,7 @@
           <label>Mode${modeSel(c.mode, c.id)}</label>
           <label>Rules${presetSel(c.preset_id, c.id)}</label>
         </div>
-        <div class="small" style="margin-top:6px" id="topic-${c.id}">${(c.topics || []).length ? `Topics: <b>${c.topics.map((t) => esc(t.title || t.id)).join(", ")}</b> · <a href="#" data-topics="${c.id}">change</a>` : `Whole group · <a href="#" data-topics="${c.id}">pick topics</a>`}</div>
+        <div class="small" style="margin-top:6px" id="topic-${c.id}">${c.feed ? `Feed · signals pushed by another app over the API` : (c.topics || []).length ? `Topics: <b>${c.topics.map((t) => esc(t.title || t.id)).join(", ")}</b> · <a href="#" data-topics="${c.id}">change</a>` : `Whole group · <a href="#" data-topics="${c.id}">pick topics</a>`}</div>
         <div class="btns"><button class="primary sm" data-save="${c.id}" data-title="${esc(c.title)}">Save</button><button class="danger sm" data-del="${c.id}">Remove</button></div>
         ${reviewHtml(c.review)}
       </div>`).join("") : `<div class="card empty small">No channels followed yet.</div>`}

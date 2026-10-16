@@ -1,9 +1,22 @@
 """Telegram signal channels, parsed signals and the trades planned from them."""
 from __future__ import annotations
 
+import zlib
 from dataclasses import asdict, dataclass, field
 
 MAX_WEIGHT = 5
+
+# Feeds are channels pushed to us over the API by another app (e.g. Market Watch) instead of
+# read from Telegram. Their ids sit far above any Telegram id so the two never collide.
+FEED_ID_BASE = 9_000_000_000_000
+
+
+def feed_channel_id(feed: str) -> int:
+    return FEED_ID_BASE + zlib.crc32(feed.encode())
+
+
+def is_feed(channel_id: int) -> bool:
+    return int(channel_id) >= FEED_ID_BASE
 
 
 @dataclass

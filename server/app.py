@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import queue
+import re
 import secrets
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -114,19 +115,20 @@ def build_service() -> TradingService:
 
 
 def build_signals(trading: TradingService):
-    """Signal service + Telegram listener, when configured. Returns None when ANTHROPIC_API_KEY is missing."""
+    """Signal service, plus the Telegram listener when configured. Feeds (signals pushed by other
+    apps) always work; reading Telegram messages needs ANTHROPIC_API_KEY."""
     from signals import SignalService
-    from signals.parser import ClaudeParser
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        log.warning("ANTHROPIC_API_KEY not set: Telegram signals disabled")
-        return None
+        log.warning("ANTHROPIC_API_KEY not set: Telegram signals disabled (feeds still work)")
+        return SignalService(trading, None)
+    from signals.parser import ClaudeParser
     saved = trading.store.get_setting("signals") or {}
     sigs = SignalService(trading, ClaudeParser(model=saved.get("model", "claude-opus-5")))
     api_id, api_hash = os.environ.get("TG_API_ID"), os.environ.get("TG_API_HASH")
     if api_id and api_hash:
         from signals.telegram import TelegramListener
         sigs.telegram = TelegramListener(int(api_id), api_hash, os.environ.get("TG_SESSION", "telegram.session"),
-                                         sigs.handle_message, [c.id for c in sigs.channels() if c.mode != "off"])
+                                         sigs.handle_message, sigs.listened_ids())
         sigs.telegram.start()
     else:
         log.warning("TG_API_ID / TG_API_HASH not set: Telegram listener disabled (parsing test still works)")
@@ -162,6 +164,24 @@ class TestParseIn(BaseModel):
 
 class PlaceIn(BaseModel):
     lot: float | None = None
+
+
+class FeedSignalIn(BaseModel):
+    id: str = Field(min_length=1, max_length=200)   # unique per message: a resend with the same id is ignored
+    action: str = "open"                            # open | close | close_partial | move_sl | modify_tp
+    side: Side | None = None
+    entry: float | None = None
+    sl: float | None = None
+    tps: list[float] = Field(default_factory=list)
+    close_pct: float | None = None
+    move_sl_to: str | None = None                   # "breakeven" or a price
+    note: str = ""
+    title: str | None = None                        # channel name used when the feed is first seen
+    confidence: float = 1.0
+    reanchor: bool = False                          # shift entry/SL/TPs onto our price, keeping their distances
+
+
+FEED_KEY = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 
 
 def create_app(service: TradingService | None = None, token: str | None = None, run_loop: bool = True,
@@ -349,7 +369,7 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
         if s is None:
             return {"enabled": False, "telegram": None, "settings": None}
         tg = s.telegram
-        return {"enabled": True, "settings": s.cfg.to_dict(),
+        return {"enabled": True, "settings": s.cfg.to_dict(), "parser": s.parser is not None,
                 "telegram": None if tg is None else {"connected": tg.connected, "error": tg.error,
                                                      "user": (tg.me.username or tg.me.first_name) if tg.me else None}}
 
@@ -369,6 +389,21 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     def dismiss_signal(signal_id: int, s=Depends(sigs)):
         return s.dismiss(signal_id).to_dict()
 
+    @app.post("/api/feeds/{feed}/signals", dependencies=[api])
+    def feed_signal(feed: str, body: FeedSignalIn, s=Depends(sigs)):
+        """Another app (e.g. Market Watch) pushes a structured signal; it is handled as a channel."""
+        if not FEED_KEY.match(feed):
+            raise HTTPException(400, "Feed name: lowercase letters, digits, - and _ (max 40)")
+        if body.action not in ("open", "close", "close_partial", "move_sl", "modify_tp"):
+            raise HTTPException(400, "action must be open, close, close_partial, move_sl or modify_tp")
+        if body.action == "open" and body.side is None:
+            raise HTTPException(400, "An open signal needs a side")
+        sig = s.ingest(feed, body.id, body.action, side=body.side.value if body.side else None,
+                       entry=body.entry, sl=body.sl, tps=body.tps, close_pct=body.close_pct,
+                       move_sl_to=body.move_sl_to, note=body.note, title=body.title, confidence=body.confidence,
+                       reanchor=body.reanchor)
+        return {"status": "channel_off"} if sig is None else sig.to_dict()
+
     @app.get("/api/signals/settings", dependencies=[api])
     def signal_settings(s=Depends(sigs)):
         return s.cfg.to_dict()
@@ -380,7 +415,8 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
 
     @app.get("/api/channels", dependencies=[api])
     def channels(s=Depends(sigs)):
-        return [{**c.to_dict(), "review": s.channel_review(c.id)} for c in s.channels()]
+        from signals import is_feed
+        return [{**c.to_dict(), "feed": is_feed(c.id), "review": s.channel_review(c.id)} for c in s.channels()]
 
     @app.get("/api/channels/available", dependencies=[api])
     def available_channels(s=Depends(sigs)):

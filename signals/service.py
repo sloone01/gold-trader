@@ -1,26 +1,26 @@
-"""Receives Telegram messages, parses them, plans trades by channel trust, and places or queues them."""
+"""Receives Telegram messages and feed signals, plans trades by channel trust, and places or queues them."""
 from __future__ import annotations
 
 import logging
 import threading
 import time
-from dataclasses import asdict
+import zlib
 
 from engine import Event, Side, TradeError, TradeSettings
 from engine.units import PIP
 
 from .mapper import build_plan, settings_from_dict
-from .models import MAX_WEIGHT, Channel, ParsedSignal, Signal, SignalSettings
+from .models import MAX_WEIGHT, Channel, ParsedSignal, Signal, SignalSettings, feed_channel_id, is_feed
 from .parser import Parser, normalise
 
 log = logging.getLogger("gold-trader.signals")
 
 
 class SignalService:
-    def __init__(self, trading, parser: Parser) -> None:
+    def __init__(self, trading, parser: Parser | None) -> None:
         self.trading = trading          # server.service.TradingService
         self.store = trading.store
-        self.parser = parser
+        self.parser = parser            # None without ANTHROPIC_API_KEY: feeds still work, Telegram text can't be read
         self.lock = threading.RLock()
         saved = self.store.get_setting("signals") or {}
         self.cfg = SignalSettings(**{k: v for k, v in saved.items() if k in SignalSettings.__dataclass_fields__})
@@ -41,13 +41,17 @@ class SignalService:
             raise ValueError("mode must be off, confirm or auto")
         self.store.save_channel(ch.to_dict())
         if self.telegram:
-            self.telegram.set_channels([c.id for c in self.channels() if c.mode != "off"])
+            self.telegram.set_channels(self.listened_ids())
         return ch
+
+    def listened_ids(self) -> list[int]:
+        """Telegram ids to listen to (feeds arrive over the API instead)."""
+        return [c.id for c in self.channels() if c.mode != "off" and not is_feed(c.id)]
 
     def delete_channel(self, channel_id: int) -> bool:
         ok = self.store.delete_channel(int(channel_id))
         if self.telegram:
-            self.telegram.set_channels([c.id for c in self.channels() if c.mode != "off"])
+            self.telegram.set_channels(self.listened_ids())
         return ok
 
     def set_settings(self, cfg: SignalSettings) -> SignalSettings:
@@ -110,6 +114,9 @@ class SignalService:
         if image and text:
             shown = "[photo] " + shown
         sig = Signal(None, channel_id, channel_title or ch.title, msg_id, shown, ts or time.time(), reply_to=reply_to)
+        if self.parser is None:
+            sig.status, sig.error = "failed", "No AI parser: set ANTHROPIC_API_KEY to read channel messages"
+            return self._save(sig)
         try:
             context = self._reply_context(channel_id, reply_to)
             parsed = normalise(self.parser(text or "", context, image=image, image_type=image_type) if image
@@ -118,6 +125,9 @@ class SignalService:
             log.exception("parse failed")
             sig.status, sig.error = "failed", f"Parse failed: {ex}"
             return self._save(sig)
+        return self._route(sig, ch, parsed)
+
+    def _route(self, sig: Signal, ch: Channel, parsed: ParsedSignal) -> Signal:
         sig.parsed = parsed.to_dict()
         if parsed.action == "ignore":
             sig.status, sig.error = "ignored", parsed.reason
@@ -133,6 +143,72 @@ class SignalService:
         if parsed.action == "open":
             return self._handle_open(sig, ch, parsed)
         return self._handle_followup(sig, ch, parsed)
+
+    def ingest(self, feed: str, msg_key: str, action: str, side: str | None = None,
+               entry: float | None = None, sl: float | None = None, tps: list[float] | None = None,
+               close_pct: float | None = None, move_sl_to: str | None = None, note: str = "",
+               title: str | None = None, confidence: float = 1.0, reanchor: bool = False) -> Signal | None:
+        """A structured signal pushed by another app. The feed is a channel like any Telegram one
+        (trust weight, mode, preset, scorecard); it is created in confirm mode on first use.
+
+        msg_key identifies the message: sending the same key again returns the stored signal
+        instead of trading twice, so a sender may safely retry.
+
+        reanchor: the sender's prices come from another feed (e.g. futures vs the broker's spot), so
+        keep the distances from its entry and shift every level onto our current price."""
+        cid = feed_channel_id(feed)
+        with self.lock:
+            ch = self.channel(cid) or self.save_channel(Channel(cid, title or feed, weight=3, mode="confirm"))
+            if ch.mode == "off":
+                return None
+            msg_id = zlib.crc32(msg_key.encode())
+            for s in self.store.recent_signals(500, cid):
+                if s["msg_id"] == msg_id:
+                    return Signal(**s)
+            shift = 0.0
+            if reanchor and action == "open" and entry is not None:
+                q = self.trading.broker.quote()
+                if q is not None:
+                    shift = round((q.bid + q.ask) / 2 - entry, 2)
+                    entry = entry + shift
+                    sl = sl + shift if sl is not None else None
+                    tps = [tp + shift for tp in tps or []]
+            p = normalise(ParsedSignal(action=action, symbol="XAUUSD", side=side, entry=entry, sl=sl,
+                                       tps=list(tps or []), close_pct=close_pct, move_sl_to=move_sl_to,
+                                       confidence=confidence, reason=note))
+            sig = Signal(None, cid, ch.title, msg_id, note or _describe(p), time.time())
+            if p.action == "open":
+                held = self._holding(cid, p.side)
+                if held:
+                    sig.parsed, sig.status, sig.error = p.to_dict(), "ignored", held
+                    return self._save(sig)
+            elif p.action == "close":
+                self._withdraw_pending(cid)
+            sig = self._route(sig, ch, p)
+            if shift and sig.plan is not None and "warnings" in sig.plan:
+                sig.plan["warnings"].append(f"Levels shifted {shift / PIP:+.0f} pips onto the broker price")
+                self._save(sig)
+            return sig
+
+    def _holding(self, channel_id: int, side: str) -> str | None:
+        """A feed repeats its idea while it stays valid: one trade (or pending signal) per side is enough."""
+        for s in self.store.recent_signals(200, channel_id):
+            if (s.get("parsed") or {}).get("side") != side or (s.get("parsed") or {}).get("action") != "open":
+                continue
+            if s["status"] == "pending":
+                return f"Already waiting on signal #{s['id']} for this {side}"
+            t = self.store.trades.get(s["ticket"]) if s["status"] == "placed" and s.get("ticket") else None
+            if t and t.open:
+                return f"Already holding #{t.ticket} for this {side}"
+        return None
+
+    def _withdraw_pending(self, channel_id: int) -> None:
+        """The feed closed its idea: a trade still waiting for a tap is no longer valid."""
+        for s in self.store.recent_signals(200, channel_id):
+            if s["status"] == "pending" and (s.get("parsed") or {}).get("action") == "open":
+                sig = Signal(**s)
+                sig.status, sig.error = "dismissed", "Withdrawn by the feed before it was placed"
+                self._save(sig)
 
     def _reply_context(self, channel_id: int, reply_to: int | None) -> str:
         """What the parser needs besides the message: the current price (to expand abbreviated
@@ -168,7 +244,7 @@ class SignalService:
                 return self._place(sig, plan)
         sig.status = "pending"
         self._save(sig)
-        self.trading.publish(Event("signal", 0, f"{sig.channel_title}: {p.side} {plan['lot']} lot, SL {p.sl:g} - tap to place", "Signals"))
+        self.trading.publish(Event("signal", 0, f"{sig.channel_title}: {p.side} {plan['lot']} lot, SL {p.sl if p.sl is not None else 'default'} - tap to place", "Signals"))
         return sig
 
     def _place(self, sig: Signal, plan: dict) -> Signal:
@@ -285,6 +361,8 @@ class SignalService:
 
     def test_parse(self, text: str, channel_id: int | None = None) -> dict:
         """Parse a message and show the plan without storing or trading anything."""
+        if self.parser is None:
+            raise TradeError("No AI parser: set ANTHROPIC_API_KEY")
         p = normalise(self.parser(text, ""))
         out = {"parsed": p.to_dict(), "plan": None}
         if p.action == "open":
@@ -318,3 +396,14 @@ class SignalService:
         d = self.store.save_signal(sig.to_dict())
         sig.id = d["id"]
         return sig
+
+
+def _describe(p: ParsedSignal) -> str:
+    """Readable text for a feed signal, shown where a Telegram message would be."""
+    if p.action != "open":
+        return p.action.replace("_", " ").capitalize()
+    parts = [f"{(p.side or '').upper()} XAUUSD" + (f" @ {p.entry:g}" if p.entry is not None else "")]
+    if p.sl is not None:
+        parts.append(f"SL {p.sl:g}")
+    parts += [f"TP{i} {tp:g}" for i, tp in enumerate(p.tps, 1)]
+    return " ".join(parts)

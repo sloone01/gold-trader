@@ -69,6 +69,23 @@ How a signal becomes a trade:
 - Each channel has a **scorecard** (signals, placed, win rate, pips, $) so you can raise or lower its weight as it proves itself. After 10 closed trades it suggests a direction.
 - **Try a message** on the Signals screen parses any text without trading, to check how a channel's style is read.
 
+### Feeds: signals from another app
+
+Another program can push structured signals instead of Telegram messages, and each sender is handled as a channel: it shows up in **Signals → Channels** with its own trust weight, mode, preset and scorecard, and its trades get the same P1–P3, trailing and risk limits. Market Watch (the `trading` repo) uses this for its gold ideas.
+
+```
+POST /api/feeds/market-watch/signals          Authorization: Bearer <GT_TOKEN>
+{"id": "4h-buy-1729080000000", "title": "Market Watch", "side": "buy",
+ "entry": 2650, "sl": 2645, "tps": [2655, 2660, 2670], "reanchor": true}
+{"id": "4h-buy-1729080000000:close", "action": "close"}
+```
+
+- A new feed starts in **confirm** mode at weight 3; switch it to `auto` in the app once you trust it. No `ANTHROPIC_API_KEY` is needed for feeds.
+- `id` must be unique per message; resending the same id returns the stored signal, so senders can retry safely.
+- One trade per side per feed: a repeated buy while a buy from that feed is open (or waiting for your tap) is ignored.
+- `close` closes the feed's open trade, and withdraws an open signal still waiting for a tap. `close_partial`, `move_sl` and `modify_tp` work as for Telegram follow-ups.
+- `reanchor: true` keeps the distances from the sender's entry but moves the levels onto the broker's price (for senders whose prices come from futures or another feed).
+
 ### Reaching it from outside the VPS
 
 Port 8080 is plain HTTP. Don't expose it to the internet directly. Pick one:
@@ -91,6 +108,7 @@ The token is the only lock on the door, so keep it long and private. Use a demo 
 | GET | /api/history · /api/events · /api/events/stream | closed trades · alert feed · SSE |
 | GET/POST/PUT/DELETE | /api/presets | presets |
 | GET/PUT | /api/limits | max lot, daily loss, max spread |
+| POST | /api/feeds/{feed}/signals | structured signal from another app, handled as a channel (see Feeds) |
 
 ## Defaults (change in `engine/engine.py` or `.env`)
 
