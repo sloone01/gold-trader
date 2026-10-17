@@ -74,8 +74,8 @@ class MarketConfig:
             timeframes=tfs or [DEFAULT_TIMEFRAME],
             twelvedata_key=os.environ.get("TWELVEDATA_API_KEY", ""),
             marketaux_key=os.environ.get("MARKETAUX_API_KEY", ""),
-            alert_bot_token=os.environ.get("MW_ALERT_BOT_TOKEN", ""),
-            alert_chat_id=os.environ.get("MW_ALERT_CHAT_ID", ""),
+            alert_bot_token=os.environ.get("MW_ALERT_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN", ""),   # old names work
+            alert_chat_id=os.environ.get("MW_ALERT_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID", ""),
             news_filter=_bool("NEWS_FILTER_ENABLED", True),
             news_before_min=_num("NEWS_BLOCK_BEFORE_MIN", 60),
             news_after_min=_num("NEWS_BLOCK_AFTER_MIN", 180),

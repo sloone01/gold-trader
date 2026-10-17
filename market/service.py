@@ -23,7 +23,7 @@ FEED = "market-watch"
 
 
 class MarketService:
-    def __init__(self, cfg: MarketConfig, trading=None, signals=None, fetch=None) -> None:
+    def __init__(self, cfg: MarketConfig, trading=None, signals=None, fetch=None, autotrader=None, sweepbos=None) -> None:
         self.cfg = cfg
         self.trading = trading          # server.service.TradingService (broker candles for gold, events)
         self.signals = signals          # signals.SignalService (the gold feed)
@@ -33,6 +33,8 @@ class MarketService:
         self.flips: list[dict] = []
         self._last_labels: dict[str, dict[str, str]] = {}
         self.feed = GoldFeed(self)
+        self.autotrader = autotrader    # market.autotrader.AutoTrader for the non-gold assets (optional)
+        self.sweepbos = sweepbos        # market.sweepbos.SweepBos (optional)
         self.lock = threading.Lock()
         self._refreshing: set[str] = set()
         self._stop = threading.Event()
@@ -46,6 +48,16 @@ class MarketService:
             return
         self._thread = threading.Thread(target=self._loop, name="market", daemon=True)
         self._thread.start()
+        if self.sweepbos and self.sweepbos.cfg.enabled:
+            threading.Thread(target=self._sweep_loop, name="sweep-bos", daemon=True).start()
+
+    def _sweep_loop(self) -> None:
+        while not self._stop.is_set():      # 5m bars close often: scan every minute
+            try:
+                self.sweepbos.run()
+            except Exception:
+                log.exception("sweep+bos failed")
+            self._stop.wait(60)
 
     def stop(self) -> None:
         self._stop.set()
@@ -128,7 +140,11 @@ class MarketService:
         }
         if tf["id"] == self.cfg.feed_timeframe:
             self.feed.run(snap)
+        if self.autotrader:
+            self.autotrader.run(snap)
         snap["flips"], snap["feed"] = self.flips, self.feed.status()
+        snap["autotrade"] = self.autotrader.status() if self.autotrader else None
+        snap["sweepbos"] = self.sweepbos.status() if self.sweepbos else None
         return snap
 
     def _fetch(self, asset: dict, tf: dict) -> tuple[dict, bool]:

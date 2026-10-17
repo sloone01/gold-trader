@@ -22,6 +22,9 @@ market/           Market Watch, built in (was the separate `trading` app)
   signals.py      regime-aware composite score (-100..+100), confidence, buy/sell idea, EN/AR summary
   calibrate.py    walk-forward weight calibration, saved in the database
   service.py      background refresh per timeframe, flip alerts, the gold feed into Signals
+  autotrader.py   auto-trade for the non-gold assets (risk sizing, BE/trailing, filters)
+  sweepbos.py     Sweep+BOS strategy (gold setups become a Signals channel)
+  mt5_multi.py    any-symbol MT5 orders/positions/deals (the old bridge, in-process)
 signals/
   parser.py       Claude turns a Telegram message into a structured signal
   mapper.py       signal + channel trust + preset rules -> trade plan (lot by weight, Far SL, P1-P3)
@@ -82,6 +85,10 @@ The **Markets** tab is the former Market Watch app, now part of Gold Trader: gol
 - Works with no keys (demo data, labelled). Gold uses the MT5 terminal's own candles, so the analysis sees the prices you trade at. Set `TWELVEDATA_API_KEY` and `MARKETAUX_API_KEY` for live metals/FX/oil and news; crypto comes from Binance.
 - **The gold idea is a channel.** On the feed timeframe (`MW_FEED_TIMEFRAME`, 4h), a gold buy/sell idea goes to **Signals** as the "Market Watch" channel: confirm mode at first, then auto once you trust it, with its own weight, preset and scorecard, and the engine manages it with P1–P3, trailing and your limits. A flip closes the trade and opens the other side; no entries during high-impact news.
 - Signal flips show up in the event feed, and optionally as Telegram bot messages (`MW_ALERT_BOT_TOKEN` / `MW_ALERT_CHAT_ID`).
+- **Sweep+BOS** (`SWEEP_BOS_ENABLED`): 4H structure, 1H zones, a 5M liquidity sweep and break of structure. Gold setups arrive in Signals as their own "Sweep+BOS" channel, with their own trust weight and scorecard.
+- **Auto-trade for the other assets** (`AUTO_TRADE_ENABLED`, off by default): silver, oil, forex and crypto ideas become MT5 orders through the same terminal, sized by risk % per signal level, with break-even and trailing stops, optional partial TPs, a higher-timeframe trend check, news blackout, session block hours and a losing-streak pause. Starts in `dry_run`; refuses real accounts unless `AUTO_TRADE_ALLOW_LIVE=true`. Gold is never traded here.
+
+**Moving over from the old `trading` app:** copy your keys and `AUTO_TRADE_*` / `SWEEP_BOS_*` / `MT5_SYMBOL_*` lines into this `.env`. `AUTO_TRADE_MODE=bridge` now means `mt5`, and the separate MT5 bridge, `GOLD_TRADER_*` settings and Node server are no longer needed. `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` still work for flip alerts. The old backtest scripts (`scripts/backtest*.js`) were not ported.
 
 ### Feeds: signals from another app
 
@@ -125,6 +132,7 @@ The token is the only lock on the door, so keep it long and private. Use a demo 
 | GET | /api/market?tf=4h · /api/market/assets/{id} | Markets snapshot · one asset |
 | POST | /api/market/refresh?tf= | refresh now (rate-limited) |
 | GET | /api/market/calendar · /api/market/feed | high-impact news · gold feed status |
+| GET | /api/market/autotrade · /api/market/performance?days=7&strategy=main\|sweepbos | auto-trader / Sweep+BOS status · closed-trade stats |
 | POST | /api/feeds/{feed}/signals | structured signal from another app, handled as a channel (see Feeds) |
 
 ## Defaults (change in `engine/engine.py` or `.env`)

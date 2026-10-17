@@ -185,9 +185,27 @@ FEED_KEY = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 
 
 def build_market(trading: TradingService, signals):
-    from market import MarketConfig, MarketService
+    """Markets: the dashboard and gold feed always; the non-gold auto-trader and Sweep+BOS when enabled.
+    Orders for other symbols need the MT5 broker (GT_BROKER=mt5)."""
+    from market import MarketConfig, MarketService, providers
+    from market.autotrader import AutoTradeConfig, AutoTrader
+    from market.sweepbos import SweepBos, SweepBosConfig
     cfg = MarketConfig.from_env()
-    return MarketService(cfg, trading, signals) if cfg.enabled else None
+    if not cfg.enabled:
+        return None
+    at_cfg, sb_cfg = AutoTradeConfig.from_env(), SweepBosConfig.from_env()
+    mt = None
+    if os.environ.get("GT_BROKER", "mt5").lower() == "mt5" and (
+            (at_cfg.enabled and at_cfg.mode == "mt5") or (sb_cfg.enabled and set(sb_cfg.assets) - {"gold"})):
+        from market.mt5_multi import MT5Multi
+        mt = MT5Multi(allow_live=at_cfg.allow_live)
+    market = MarketService(cfg, trading, signals)
+    if at_cfg.enabled:
+        market.autotrader = AutoTrader(at_cfg, market, mt, news_blackout=lambda aid: providers.news_blackout(aid, cfg))
+        market.autotrader.extra_magics = (sb_cfg.magic,)
+    if sb_cfg.enabled:
+        market.sweepbos = SweepBos(sb_cfg, market, signals, mt, at_cfg.symbols)
+    return market
 
 
 def create_app(service: TradingService | None = None, token: str | None = None, run_loop: bool = True,
@@ -496,6 +514,23 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     @app.get("/api/market/feed", dependencies=[api])
     def market_feed(m=Depends(mkt)):
         return m.feed.status()
+
+    @app.get("/api/market/autotrade", dependencies=[api])
+    def market_autotrade(m=Depends(mkt)):
+        return {"autotrade": m.autotrader.status() if m.autotrader else {"enabled": False},
+                "sweepbos": m.sweepbos.status() if m.sweepbos else {"enabled": False}}
+
+    @app.get("/api/market/performance", dependencies=[api])
+    def market_performance(days: int = 7, strategy: str = "main", m=Depends(mkt)):
+        """Closed auto-trader (main) or Sweep+BOS trades on other symbols, from MT5 deal history."""
+        from market.autotrader import summarize_deals
+        mt = getattr(m.autotrader, "mt", None) or getattr(m.sweepbos, "mt", None)
+        if mt is None:
+            raise HTTPException(503, "Needs the MT5 broker and the auto-trader in mt5 mode")
+        days = max(1, min(days, 90))
+        magic = (m.sweepbos.cfg.magic if strategy == "sweepbos" and m.sweepbos
+                 else m.autotrader.cfg.magic if m.autotrader else 260731)
+        return summarize_deals(mt.deals(days, magic), days)
 
     # -- the app itself
 

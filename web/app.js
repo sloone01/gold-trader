@@ -941,6 +941,20 @@
       <div class="muted">${f.holding ? `${mt("holding")}: <span class="side ${f.holding.side}">${mt(f.holding.side)}</span> · ` : ""}${last ? `${esc(last.type)} ${esc(last.side || "")} → ${esc(last.status || "")}${last.reason ? " · " + esc(last.reason) : ""} · ${fmt.date(last.at)}` : "—"}${f.error ? ` · <span class="neg">${esc(f.error)}</span>` : ""}</div></div></a>`;
   }
 
+  function autoCard(snap) {
+    const at = snap.autotrade, sb = snap.sweepbos, out = [];
+    if (at?.enabled) {
+      const label = { dry_run: "dry run (no orders)", demo: "DEMO account", live: "LIVE account", blocked_live: "blocked: live account" }[at.mode] || at.mode;
+      const last = (at.actions || [])[0];
+      out.push(`<div class="card small"><div class="row between"><b>Auto-trade · other assets</b><span class="pill ${at.mode === "live" || at.mode === "blocked_live" ? "warn" : ""}">${esc(label)}</span></div>
+        <div class="muted">TF ${esc(at.timeframe)} · gold is handled by the gold engine${at.paused?.length ? ` · paused: ${at.paused.map((p) => esc(p.symbol)).join(", ")}` : ""}${last ? ` · last: ${esc(last.type)} ${esc(last.symbol || "")} ${esc(last.side || "")}${last.reason ? " (" + esc(last.reason) + ")" : ""}` : ""}${at.error ? ` · <span class="neg">${esc(at.error)}</span>` : ""}</div></div>`);
+    }
+    if (sb?.enabled) {
+      out.push(`<div class="card small"><b>Sweep+BOS</b><div class="muted">${Object.entries(sb.watching || {}).map(([k, v]) => `${esc(k)}: ${esc(v)}`).join(" · ") || "scanning…"}</div></div>`);
+    }
+    return out.join("");
+  }
+
   async function renderMarkets() {
     if (!M.snap || M.snap.timeframe.id !== M.tf) view.innerHTML = mwHeader(M.snap) + `<div class="empty">${mt("waiting")}</div>`;
     view.dir = M.lang === "ar" ? "rtl" : "ltr";
@@ -961,6 +975,7 @@
       <div class="small muted" style="margin:8px 0">${snap.generated_at ? `${mt("updated")} ${fmt.time(snap.generated_at)}` : ""}${snap.calibration?.active ? ` · ${mt("calibrated")}` : ""} · ${mt("disclaimer")}</div>
       ${snap.assets.some((a) => a.demo_price || a.demo_news) ? `<div class="card small warn">${mt("demo")}</div>` : ""}
       ${feedCard(snap)}
+      ${autoCard(snap)}
       ${flips.length ? `<div class="card small"><b>${mt("flips")}:</b> ${flips.map((f) => `${esc(M.lang === "ar" ? f.name_ar : f.name)} ${f.timeframe}: ${SIG[M.lang][f.from]} → <b>${SIG[M.lang][f.to]}</b>`).join(" · ")}</div>` : ""}
       <div class="grid2">${ideaCol("buy", tri.buys)}${ideaCol("sell", tri.sells)}</div>
       <div class="grid3">${triBlock(mt("bull"), tri.bullish, (a) => sgn(a.composite))}${triBlock(mt("bear"), tri.bearish, (a) => sgn(a.composite))}${triBlock(mt("movers"), tri.movers, (a) => sgn(n2(a.change_pct)) + "%")}</div>
