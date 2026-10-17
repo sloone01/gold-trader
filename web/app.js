@@ -124,7 +124,7 @@
     S.route = route || "home";
     S.param = param || null;
     if (S.route === "trade" && !S.form) S.form = null;
-    const tab = { detail: "home", channels: "signals", presets: "settings" }[S.route] || S.route;
+    const tab = { detail: "home", channels: "signals", presets: "settings", asset: "markets" }[S.route] || S.route;
     document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("on", a.dataset.tab === tab));
     S.detailEdit = {};
     render();
@@ -132,8 +132,11 @@
   window.addEventListener("hashchange", navigate);
 
   async function render() {
+    if (S.route !== "markets" && S.route !== "asset") view.dir = "ltr";
     try {
       switch (S.route) {
+        case "markets": return await renderMarkets();
+        case "asset": return await renderAsset();
         case "home": return renderHome();
         case "trade": return renderTradeForm();
         case "detail": return renderDetail();
@@ -790,6 +793,230 @@
     });
     $("#logout").addEventListener("click", () => { localStorage.removeItem("gt_token"); S.token = ""; location.reload(); });
   }
+
+  // ---------------------------------------------------------------- markets
+  // Market Watch: signals and trade ideas for gold, silver, oil, forex and crypto. English / Arabic.
+  const M = {
+    lang: localStorage.getItem("mw_lang") || "en",
+    tf: localStorage.getItem("mw_tf") || "4h",
+    kind: localStorage.getItem("mw_kind") || "all",
+    sort: localStorage.getItem("mw_sort") || "score",
+    watchOnly: localStorage.getItem("mw_watch_only") === "1",
+    watch: new Set(JSON.parse(localStorage.getItem("mw_watch") || "[]")),
+    snap: null, at: 0,
+  };
+  const MT = {
+    en: {
+      title: "Markets", lang: "العربية", refresh: "Refresh", updated: "Updated", waiting: "Loading market data…",
+      demo: "Some prices are <b>demo data</b>. Set <code>TWELVEDATA_API_KEY</code> (metals, FX, oil) and <code>MARKETAUX_API_KEY</code> (news) in .env for live feeds.",
+      disclaimer: "Rule-based technical analysis. Not financial advice.",
+      buys: "Buy ideas", sells: "Sell ideas", bull: "Strongest buy", bear: "Strongest sell", movers: "Biggest movers",
+      none: "None above the threshold.", lean: "Lean, not active yet", empty: "No assets match these filters.",
+      kinds: { all: "All", metal: "Metals", energy: "Energy", forex: "Forex", crypto: "Crypto" },
+      sorts: { score: "Score", abs: "|Score|", change: "Move %", confidence: "Confidence", name: "Name" },
+      watchOnly: "Watchlist", watchAll: "All assets", conf: "conf", hit: "hit-rate", calibrated: "calibrated",
+      regimes: { trending: "trending", ranging: "range-bound" },
+      buy: "BUY", sell: "SELL", hold: "HOLD", entry: "Entry", stop: "Stop", target: "Target", rr: "R:R",
+      idea: "Trade idea", chart: "Price & overlays", summary: "Summary", weights: "Active weights",
+      indicators: "Indicators", built: "How the signal is built", news: "News & sentiment", noNews: "No recent headlines.",
+      composite: "Composite", scale: "−100 to +100", regime: "regime", agree: "agreement",
+      feed: "Gold idea → Market Watch channel", feedOff: "Gold feed off", holding: "holding", calendar: "High-impact news",
+      noEvents: "No high-impact events in the next 48 h.", flips: "Signal flips",
+      ind: ["Price", "RSI 14", "ADX 14", "SMA 20", "SMA 50", "EMA 20", "EMA 50", "MACD hist.", "ATR 14", "Support", "Resistance"],
+      comp: { trend: "Trend", rsi: "RSI", macd: "MACD", bollinger: "Bollinger", news: "News" },
+      channel: "Channel settings",
+    },
+    ar: {
+      title: "الأسواق", lang: "English", refresh: "تحديث", updated: "آخر تحديث", waiting: "جارٍ تحميل بيانات السوق…",
+      demo: "بعض الأسعار <b>بيانات تجريبية</b>. أضف <code>TWELVEDATA_API_KEY</code> و<code>MARKETAUX_API_KEY</code> في .env للبيانات الحية.",
+      disclaimer: "تحليل فني قائم على قواعد. ليس نصيحة مالية.",
+      buys: "أفكار شراء", sells: "أفكار بيع", bull: "أقوى شراء", bear: "أقوى بيع", movers: "الأكبر تحركًا",
+      none: "لا شيء فوق العتبة.", lean: "ميل، غير مفعّل بعد", empty: "لا أصول تطابق هذه الفلاتر.",
+      kinds: { all: "الكل", metal: "معادن", energy: "طاقة", forex: "عملات", crypto: "رقمية" },
+      sorts: { score: "الدرجة", abs: "|الدرجة|", change: "التحرك %", confidence: "الثقة", name: "الاسم" },
+      watchOnly: "المفضلة", watchAll: "كل الأصول", conf: "الثقة", hit: "الإصابة", calibrated: "معاير",
+      regimes: { trending: "اتجاهي", ranging: "نطاقي" },
+      buy: "شراء", sell: "بيع", hold: "انتظار", entry: "الدخول", stop: "الوقف", target: "الهدف", rr: "عائد/مخاطرة",
+      idea: "فكرة الصفقة", chart: "السعر والطبقات", summary: "الملخص", weights: "الأوزان النشطة",
+      indicators: "المؤشرات", built: "كيف تُبنى الإشارة", news: "الأخبار والمشاعر", noNews: "لا توجد عناوين حديثة.",
+      composite: "الدرجة المجمعة", scale: "من −100 إلى +100", regime: "النظام", agree: "التوافق",
+      feed: "فكرة الذهب ← قناة Market Watch", feedOff: "تغذية الذهب متوقفة", holding: "مركز", calendar: "أخبار عالية التأثير",
+      noEvents: "لا أحداث عالية التأثير خلال 48 ساعة.", flips: "تغيّر الإشارات",
+      ind: ["السعر", "القوة النسبية", "مؤشر الاتجاه", "متوسط 20", "متوسط 50", "أسي 20", "أسي 50", "هيستوغرام ماكد", "المدى الحقيقي", "الدعم", "المقاومة"],
+      comp: { trend: "الاتجاه", rsi: "القوة النسبية", macd: "ماكد", bollinger: "بولينجر", news: "الأخبار" },
+      channel: "إعدادات القناة",
+    },
+  };
+  const mt = (k) => MT[M.lang][k];
+  const SIG = { en: { bullish: "BUY", bearish: "SELL", neutral: "HOLD" }, ar: { bullish: "شراء", bearish: "بيع", neutral: "انتظار" } };
+  const KINDS = ["all", "metal", "energy", "forex", "crypto"];
+  const aname = (a) => (M.lang === "ar" ? a.name_ar : a.name);
+  const ltr = (s) => `<span dir="ltr">${s}</span>`;
+  const px = (n) => (n == null ? "—" : n >= 1000 ? Number(n).toLocaleString("en-US", { maximumFractionDigits: 2 }) : n >= 1 ? Number(n).toFixed(4) : Number(n).toFixed(6));
+  const n2 = (n, d = 2) => (n == null ? "—" : Number(n).toFixed(d));
+  const sgn = (n) => (n > 0 ? "+" : "") + n;
+  const scol = (label) => (label === "bullish" ? "var(--buy)" : label === "bearish" ? "var(--sell)" : "var(--muted)");
+  const mset = (k, v) => { M[k] = v; try { localStorage.setItem("mw_" + k, typeof v === "boolean" ? (v ? "1" : "0") : v); } catch (_) {} };
+
+  async function loadMarket(force = false) {
+    if (!force && M.snap && M.snap.timeframe.id === M.tf && Date.now() - M.at < 30000) return M.snap;
+    M.snap = await api(`/market?tf=${encodeURIComponent(M.tf)}`);
+    M.at = Date.now();
+    return M.snap;
+  }
+
+  function spark(vals, color) {
+    if (!vals || vals.length < 2) return "";
+    const w = 254, h = 40, min = Math.min(...vals), max = Math.max(...vals), r = max - min || 1;
+    const pts = vals.map((v, i) => `${(2 + (i / (vals.length - 1)) * (w - 4)).toFixed(1)},${(2 + (1 - (v - min) / r) * (h - 4)).toFixed(1)}`);
+    return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline fill="none" stroke="${color}" stroke-width="2" points="${pts.join(" ")}"/></svg>`;
+  }
+
+  function meter(score) {
+    const color = score >= 25 ? "var(--buy)" : score <= -25 ? "var(--sell)" : "var(--muted)";
+    const half = Math.min(Math.abs(score), 100) / 2;
+    return `<div class="meter"><div class="meter-mid"></div><div class="meter-fill" style="${score >= 0 ? "left" : "right"}:50%;width:${half}%;background:${color}"></div></div>`;
+  }
+
+  function overlay(ch) {
+    if (!ch || !ch.close || ch.close.length < 2) return "";
+    const w = 700, h = 220, pad = 10;
+    const all = [...ch.close, ...ch.sma20, ...ch.ema20, ...ch.bb_upper, ...ch.bb_lower].filter((v) => v != null);
+    const min = Math.min(...all), max = Math.max(...all), r = max - min || 1, n = ch.close.length;
+    const path = (arr) => arr.reduce((d, v, i) => (v == null ? d : d + `${d ? "L" : "M"}${(pad + (i / (n - 1)) * (w - pad * 2)).toFixed(1)},${(pad + (1 - (v - min) / r) * (h - pad * 2)).toFixed(1)} `), "");
+    const line = (arr, color, width, dash) => `<path d="${path(arr)}" fill="none" stroke="${color}" stroke-width="${width}" ${dash ? `stroke-dasharray="${dash}"` : ""}/>`;
+    return `<div class="chart"><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+      ${line(ch.bb_upper, "#5b6478", 1, "4 3")}${line(ch.bb_mid, "#5b6478", 1, "2 3")}${line(ch.bb_lower, "#5b6478", 1, "4 3")}
+      ${line(ch.sma20, "#5aa9ff", 1.5)}${line(ch.ema20, "#b48cff", 1.5)}${line(ch.close, "#e8eaf0", 2)}</svg>
+      <div class="legend small"><span style="color:#e8eaf0">■ Price</span><span style="color:#5aa9ff">■ SMA 20</span><span style="color:#b48cff">■ EMA 20</span><span style="color:#8b93a7">┄ Bollinger</span></div></div>`;
+  }
+
+  function sidePill(tr) {
+    if (tr?.active) return `<span class="side ${tr.side}">${mt(tr.side)}</span>`;
+    if (tr?.side) return `<span class="pill">${mt(tr.side)}…</span>`;
+    return `<span class="pill">${mt("hold")}</span>`;
+  }
+
+  function mwHeader(snap) {
+    const tfs = (snap?.timeframes || [{ id: "5m", label: "5M" }, { id: "15m", label: "15M" }, { id: "1h", label: "1H" }, { id: "4h", label: "4H" }, { id: "1d", label: "1D" }]);
+    return `<div class="row between"><h1>${mt("title")}</h1><div class="row"><button class="sm ghost" id="mw-lang">${mt("lang")}</button><button class="sm" id="mw-refresh">${mt("refresh")}</button></div></div>
+      <div class="seg" id="mw-tf">${tfs.map((t) => `<button data-tf="${t.id}" class="${t.id === M.tf ? "on" : ""}">${M.lang === "ar" ? t.label_ar || t.label : t.label}</button>`).join("")}</div>`;
+  }
+
+  function wireHeader() {
+    $("#mw-lang").onclick = () => { mset("lang", M.lang === "en" ? "ar" : "en"); render(); };
+    $("#mw-refresh").onclick = async (e) => {
+      e.target.disabled = true;
+      try { await api(`/market/refresh?tf=${M.tf}`, { method: "POST" }); await loadMarket(true); render(); } catch (err) { fail(err); e.target.disabled = false; }
+    };
+    document.querySelectorAll("#mw-tf button").forEach((b) => (b.onclick = () => { mset("tf", b.dataset.tf); render(); }));
+  }
+
+  function ideaCol(side, rows) {
+    const items = (rows || []).map((a) => `<div class="mw-row" data-asset="${a.id}">
+        <div class="row between"><b>${esc(aname(a))}</b><span style="color:${side === "buy" ? "var(--buy)" : "var(--sell)"}">${ltr(sgn(a.composite))}</span></div>
+        <div class="small muted">${a.active && a.entry != null ? `${mt("entry")} ${ltr(px(a.entry))} · ${mt("stop")} ${ltr(px(a.stop))} · ${mt("target")} ${ltr(px(a.target))} · ${mt("rr")} ${ltr(a.risk_reward)}` : mt("lean")}</div>
+      </div>`).join("");
+    return `<div class="card mw-col ${side}"><div class="row between"><h3>${mt(side === "buy" ? "buys" : "sells")}</h3><span class="side ${side}">${(rows || []).length}</span></div>${items || `<div class="small muted">${mt("none")}</div>`}</div>`;
+  }
+
+  function assetCard(a) {
+    const s = a.signal, col = scol(s.label), up = a.change_pct >= 0, on = M.watch.has(a.id);
+    return `<div class="card clickable mw-card" data-asset="${a.id}">
+      <div class="row between"><div class="row"><button class="star ${on ? "on" : ""}" data-star="${a.id}">★</button><b>${esc(aname(a))}</b>${a.demo_price ? `<span class="pill warn">demo</span>` : a.stale ? `<span class="pill">stale</span>` : ""}</div>
+        <span class="muted small">${esc(MT[M.lang].kinds[a.kind] || a.kind)}</span></div>
+      <div class="row between" style="margin-top:4px"><span class="big">${ltr(px(a.price))}</span><span class="${up ? "pos" : "neg"}">${up ? "▲" : "▼"} ${ltr(n2(Math.abs(a.change_pct)) + "%")}</span></div>
+      ${spark(a.spark, col)}
+      <div class="row"><span class="pill" style="color:${col}">${SIG[M.lang][s.label]}</span>${meter(s.composite)}<b style="color:${col}">${ltr(sgn(s.composite))}</b></div>
+      <div class="pills">${sidePill(s.trade)}<span class="pill">${mt("conf")} ${s.confidence}%</span><span class="pill">${MT[M.lang].regimes[s.regime.regime]}</span>${s.hit_rate ? `<span class="pill">${mt("hit")} ${s.hit_rate.rate}%</span>` : ""}<span class="pill">${esc(a.source)}</span></div>
+    </div>`;
+  }
+
+  function feedCard(snap) {
+    const f = snap.feed;
+    if (!f) return "";
+    if (!f.enabled) return `<div class="card small muted">${mt("feedOff")}</div>`;
+    const last = (f.actions || [])[0];
+    return `<a href="#/channels"><div class="card small clickable"><div class="row between"><b style="color:var(--gold)">${mt("feed")}</b><span class="muted">${f.timeframe}</span></div>
+      <div class="muted">${f.holding ? `${mt("holding")}: <span class="side ${f.holding.side}">${mt(f.holding.side)}</span> · ` : ""}${last ? `${esc(last.type)} ${esc(last.side || "")} → ${esc(last.status || "")}${last.reason ? " · " + esc(last.reason) : ""} · ${fmt.date(last.at)}` : "—"}${f.error ? ` · <span class="neg">${esc(f.error)}</span>` : ""}</div></div></a>`;
+  }
+
+  async function renderMarkets() {
+    if (!M.snap || M.snap.timeframe.id !== M.tf) view.innerHTML = mwHeader(M.snap) + `<div class="empty">${mt("waiting")}</div>`;
+    view.dir = M.lang === "ar" ? "rtl" : "ltr";
+    const snap = await loadMarket();
+    const cal = await api("/market/calendar?hours=48").catch(() => ({ upcoming: [] }));
+    if (S.route !== "markets") return;
+    let list = [...snap.assets];
+    if (M.kind !== "all") list = list.filter((a) => a.kind === M.kind);
+    if (M.watchOnly) list = list.filter((a) => M.watch.has(a.id));
+    const by = { score: (a, b) => b.signal.composite - a.signal.composite, abs: (a, b) => Math.abs(b.signal.composite) - Math.abs(a.signal.composite),
+      change: (a, b) => Math.abs(b.change_pct) - Math.abs(a.change_pct), confidence: (a, b) => b.signal.confidence - a.signal.confidence,
+      name: (a, b) => aname(a).localeCompare(aname(b), M.lang) };
+    list.sort(by[M.sort] || by.score);
+    const tri = snap.triage || {};
+    const triBlock = (title, rows, val) => `<div class="card mw-tri"><div class="small muted">${title}</div>${(rows || []).map((a) => `<div class="row between mw-row" data-asset="${a.id}"><span>${esc(aname(a))}</span><span style="color:${scol(a.label)}">${ltr(val(a))}</span></div>`).join("") || "—"}</div>`;
+    const flips = (snap.flips || []).slice(0, 4);
+    view.innerHTML = mwHeader(snap) + `
+      <div class="small muted" style="margin:8px 0">${snap.generated_at ? `${mt("updated")} ${fmt.time(snap.generated_at)}` : ""}${snap.calibration?.active ? ` · ${mt("calibrated")}` : ""} · ${mt("disclaimer")}</div>
+      ${snap.assets.some((a) => a.demo_price || a.demo_news) ? `<div class="card small warn">${mt("demo")}</div>` : ""}
+      ${feedCard(snap)}
+      ${flips.length ? `<div class="card small"><b>${mt("flips")}:</b> ${flips.map((f) => `${esc(M.lang === "ar" ? f.name_ar : f.name)} ${f.timeframe}: ${SIG[M.lang][f.from]} → <b>${SIG[M.lang][f.to]}</b>`).join(" · ")}</div>` : ""}
+      <div class="grid2">${ideaCol("buy", tri.buys)}${ideaCol("sell", tri.sells)}</div>
+      <div class="grid3">${triBlock(mt("bull"), tri.bullish, (a) => sgn(a.composite))}${triBlock(mt("bear"), tri.bearish, (a) => sgn(a.composite))}${triBlock(mt("movers"), tri.movers, (a) => sgn(n2(a.change_pct)) + "%")}</div>
+      <div class="chips">${KINDS.map((k) => `<button class="sm ${M.kind === k ? "on" : ""}" data-kind="${k}">${MT[M.lang].kinds[k]}</button>`).join("")}
+        <select id="mw-sort" style="width:auto;margin:0">${Object.entries(mt("sorts")).map(([k, v]) => `<option value="${k}" ${M.sort === k ? "selected" : ""}>${v}</option>`).join("")}</select>
+        <button class="sm ${M.watchOnly ? "on" : ""}" id="mw-watch">${M.watchOnly ? mt("watchAll") : mt("watchOnly")}</button></div>
+      ${list.map(assetCard).join("") || `<div class="card empty">${mt("empty")}</div>`}
+      <h2>${mt("calendar")}</h2>
+      <div class="card">${(cal.upcoming || []).map((e) => `<div class="event"><span class="t">${fmt.date(e.time)}</span><span class="m">${esc(e.currency)} · ${esc(e.title)}</span></div>`).join("") || `<div class="small muted">${mt("noEvents")}</div>`}</div>`;
+    wireHeader();
+    view.querySelectorAll("[data-asset]").forEach((el) => (el.onclick = (e) => { if (!e.target.closest("[data-star]")) location.hash = `#/asset/${el.dataset.asset}`; }));
+    view.querySelectorAll("[data-star]").forEach((b) => (b.onclick = (e) => {
+      e.stopPropagation();
+      const id = b.dataset.star;
+      M.watch.has(id) ? M.watch.delete(id) : M.watch.add(id);
+      try { localStorage.setItem("mw_watch", JSON.stringify([...M.watch])); } catch (_) {}
+      render();
+    }));
+    view.querySelectorAll("[data-kind]").forEach((b) => (b.onclick = () => { mset("kind", b.dataset.kind); render(); }));
+    $("#mw-sort").onchange = (e) => { mset("sort", e.target.value); render(); };
+    $("#mw-watch").onclick = () => { mset("watchOnly", !M.watchOnly); render(); };
+  }
+
+  async function renderAsset() {
+    view.dir = M.lang === "ar" ? "rtl" : "ltr";
+    const snap = await loadMarket();
+    const a = snap.assets.find((x) => x.id === S.param);
+    if (!a) { location.hash = "#/markets"; return; }
+    const s = a.signal, ind = a.indicators, tr = s.trade, col = scol(s.label);
+    const vals = [px(ind.price), n2(ind.rsi14, 1), n2(ind.adx14, 1), px(ind.sma20), px(ind.sma50), px(ind.ema20), px(ind.ema50),
+      ind.macd ? n2(ind.macd.histogram, 4) : "—", px(ind.atr14), ind.levels ? px(ind.levels.support) : "—", ind.levels ? px(ind.levels.resistance) : "—"];
+    const idea = tr?.active
+      ? `<div class="card"><div class="row between"><span class="side ${tr.side}">${mt(tr.side)}</span><span class="muted small">${mt("rr")} ${ltr(tr.risk_reward)}</span></div>
+          <div class="grid3">${[["entry", tr.entry], ["stop", tr.stop], ["target", tr.target]].map(([k, v]) => `<div class="stat"><div class="label">${mt(k)}</div><div class="value">${ltr(px(v))}</div></div>`).join("")}</div>
+          <p class="small muted">${esc(M.lang === "ar" ? tr.note.ar : tr.note.en)}</p>
+          ${a.id === "gold" ? `<a href="#/signals"><button class="wide">→ ${esc(mt("feed"))}</button></a>` : ""}</div>`
+      : `<div class="card small">${sidePill(tr)} ${esc(tr?.reason ? (M.lang === "ar" ? tr.reason.ar : tr.reason.en) : "")}</div>`;
+    view.innerHTML = `<a class="back" href="#/markets">← ${mt("title")}</a>
+      <div class="row between"><h1>${esc(aname(a))} <span class="pill" style="color:${col}">${SIG[M.lang][s.label]}</span></h1><button class="sm ghost" id="mw-lang">${mt("lang")}</button></div>
+      <p class="small muted">${mt("composite")} <b style="color:${col}">${ltr(sgn(s.composite))}</b> (${mt("scale")}) · ${mt("conf")} <b>${s.confidence}%</b> · ${mt("regime")} ${MT[M.lang].regimes[s.regime.regime]} · ${mt("agree")} ${ltr(`${s.agreement.aligned}/${s.agreement.total}`)}${s.hit_rate ? ` · ${mt("hit")} ${s.hit_rate.rate}% (${s.hit_rate.samples})` : ""} · ${a.timeframe} · ${esc(a.source)}</p>
+      <h2>${mt("idea")}</h2>${idea}
+      <h2>${mt("chart")}</h2><div class="card">${overlay(a.chart)}</div>
+      <h2>${mt("summary")}</h2><div class="card small">${esc(M.lang === "ar" ? s.summary.ar : s.summary.en)}</div>
+      <h2>${mt("weights")}</h2><div class="pills">${Object.entries(s.weights).map(([k, v]) => `<span class="pill">${mt("comp")[k] || k} ${Math.round(v * 100)}%</span>`).join("")}</div>
+      <h2>${mt("indicators")}</h2><div class="stats">${mt("ind").map((l, i) => `<div class="stat"><div class="label">${l}</div><div class="value small">${ltr(vals[i])}</div></div>`).join("")}</div>
+      <h2>${mt("built")}</h2>${Object.entries(s.components).filter(([, c]) => c).map(([k, c]) => `<div class="card small"><div class="row between"><b>${mt("comp")[k] || k}</b><span class="pill" style="color:${scol(c.label)}">${SIG[M.lang][c.label]}</span></div><div class="muted">${esc(M.lang === "ar" ? c.note_ar : c.note)}</div></div>`).join("")}
+      <h2>${mt("news")}${a.demo_news ? ` <span class="pill warn">demo</span>` : ""}</h2>
+      ${a.news.length ? a.news.map((nw) => { const v = nw.sentiment || 0, l = v >= 0.15 ? "bullish" : v <= -0.15 ? "bearish" : "neutral", t = M.lang === "ar" && nw.title_ar ? nw.title_ar : nw.title;
+        return `<div class="card small">${nw.url ? `<a href="${esc(nw.url)}" target="_blank" rel="noopener">${esc(t)}</a>` : esc(t)}<div class="row between muted"><span>${esc(nw.source || "")}</span><span style="color:${scol(l)}">${SIG[M.lang][l]} ${ltr(v.toFixed(2))}</span></div></div>`; }).join("")
+        : `<div class="card small muted">${mt("noNews")}</div>`}`;
+    $("#mw-lang").onclick = () => { mset("lang", M.lang === "en" ? "ar" : "en"); render(); };
+  }
+
+  setInterval(() => {
+    if (S.route === "markets" && document.visibilityState === "visible") loadMarket(true).then(() => S.route === "markets" && render()).catch(() => {});
+  }, 60000);
 
   // ------------------------------------------------------------------- boot
   async function boot(attempt = 0) {

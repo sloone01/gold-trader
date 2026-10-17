@@ -69,6 +69,16 @@ class MT5Broker:
         t = mt5.symbol_info_tick(self.symbol)
         return None if t is None or t.bid == 0 else Quote(t.bid, t.ask, t.time_msc / 1000)
 
+    def candles(self, minutes: int, count: int) -> list[dict]:
+        """Recent OHLC bars for the market dashboard, oldest first."""
+        tf = {5: mt5.TIMEFRAME_M5, 15: mt5.TIMEFRAME_M15, 60: mt5.TIMEFRAME_H1,
+              240: mt5.TIMEFRAME_H4, 1440: mt5.TIMEFRAME_D1}[minutes]
+        rates = mt5.copy_rates_from_pos(self.symbol, tf, 0, count)
+        if rates is None:
+            return []
+        return [{"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(r["time"]))), "open": float(r["open"]),
+                 "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"])} for r in rates]
+
     def market_open(self) -> bool:
         s = mt5.symbol_info(self.symbol)
         if s is None or s.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:

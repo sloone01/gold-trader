@@ -1,6 +1,6 @@
 // App-shell cache only. API calls always go to the network (never cache trade state).
-const CACHE = "gold-trader-v9";
-const SHELL = ["./", "./index.html", "./styles.css?v=3", "./app.js?v=10", "./manifest.webmanifest", "./icon.svg",
+const CACHE = "gold-trader-v10";
+const SHELL = ["./", "./index.html", "./styles.css?v=4", "./app.js?v=11", "./manifest.webmanifest", "./icon.svg",
                "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

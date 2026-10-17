@@ -126,3 +126,25 @@ table input { padding: 7px 8px; margin: 0; }
 
 .back { display: inline-block; margin-bottom: 8px; color: var(--muted); }
 @media (min-width: 600px) { .stats { grid-template-columns: repeat(4, 1fr); } }
+
+/* markets */
+.pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--line);
+  font-size: 0.78em; color: var(--muted); white-space: nowrap; }
+.pill.warn { color: var(--warn); border-color: var(--warn); }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 12px 0; }
+.chips button.on { color: var(--gold); border-color: var(--gold2); }
+.spark { width: 100%; height: 40px; display: block; margin: 6px 0; }
+.meter { position: relative; flex: 1; height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
+.meter-mid { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--line); }
+.meter-fill { position: absolute; top: 0; bottom: 0; }
+.star { padding: 0 4px; border: 0; background: transparent; color: var(--line); font-size: 1.1em; }
+.star.on { color: var(--gold); }
+.mw-row { padding: 6px 0; border-bottom: 1px solid var(--line); cursor: pointer; }
+.mw-row:last-child { border-bottom: 0; }
+.mw-col.buy { border-top: 3px solid var(--buy); } .mw-col.sell { border-top: 3px solid var(--sell); }
+.mw-tri { padding: 10px; font-size: 0.85em; }
+.chart svg { width: 100%; height: 200px; display: block; }
+.legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+#view[dir=rtl] .back, #view[dir=rtl] h1 { text-align: right; }
+@media (max-width: 480px) { .grid3 .mw-tri { padding: 8px; } .grid3:has(.mw-tri) { grid-template-columns: 1fr; } }

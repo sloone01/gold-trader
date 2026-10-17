@@ -184,8 +184,14 @@ class FeedSignalIn(BaseModel):
 FEED_KEY = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 
 
+def build_market(trading: TradingService, signals):
+    from market import MarketConfig, MarketService
+    cfg = MarketConfig.from_env()
+    return MarketService(cfg, trading, signals) if cfg.enabled else None
+
+
 def create_app(service: TradingService | None = None, token: str | None = None, run_loop: bool = True,
-               signals=None) -> FastAPI:
+               signals=None, market=None) -> FastAPI:
     token = os.environ.get("GT_TOKEN", "").strip() if token is None else token
     if not token:
         log.warning("GT_TOKEN is empty: the API and dashboard are OPEN to anyone who can reach this server")
@@ -194,10 +200,16 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     async def lifespan(app: FastAPI):
         app.state.service = service or build_service()
         app.state.signals = signals if signals is not None else (build_signals(app.state.service) if service is None else None)
+        app.state.market = market if market is not None else (
+            build_market(app.state.service, app.state.signals) if service is None else None)
         if run_loop:
             app.state.service.start()
+            if app.state.market:
+                app.state.market.start()
         yield
         app.state.service.stop()
+        if app.state.market:
+            app.state.market.stop()
         if app.state.signals and app.state.signals.telegram:
             app.state.signals.telegram.stop()
 
@@ -218,6 +230,12 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
         if s is None:
             raise HTTPException(503, "Signals are disabled: set ANTHROPIC_API_KEY (and TG_API_ID/TG_API_HASH) in .env")
         return s
+
+    def mkt(request: Request):
+        m = request.app.state.market
+        if m is None:
+            raise HTTPException(503, "Market Watch is off (MW_ENABLED=false)")
+        return m
 
     def auth(request: Request) -> None:
         if not token:
@@ -447,6 +465,37 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     @app.get("/api/channels/{channel_id}/review", dependencies=[api])
     def channel_review(channel_id: int, s=Depends(sigs)):
         return s.channel_review(channel_id)
+
+    # -- market watch
+
+    @app.get("/api/market", dependencies=[api])
+    def market_snapshot(tf: str = "4h", m=Depends(mkt)):
+        return m.snapshot(tf)
+
+    @app.get("/api/market/assets/{asset_id}", dependencies=[api])
+    def market_asset(asset_id: str, tf: str = "4h", m=Depends(mkt)):
+        a = next((a for a in m.snapshot(tf)["assets"] if a["id"] == asset_id), None)
+        if a is None:
+            raise HTTPException(404, "Asset not found")
+        return a
+
+    @app.post("/api/market/refresh", dependencies=[api])
+    def market_refresh(tf: str = "4h", m=Depends(mkt)):
+        out = m.refresh_now(tf)
+        if out["status"] == "rate_limited":
+            raise HTTPException(429, f"Refreshed a moment ago; try again in {out['retry_after']} s")
+        return out
+
+    @app.get("/api/market/calendar", dependencies=[api])
+    def market_calendar(hours: float = 48, m=Depends(mkt)):
+        from market import providers
+        return {"filter": {"enabled": m.cfg.news_filter, "before_min": m.cfg.news_before_min,
+                           "after_min": m.cfg.news_after_min, "impacts": m.cfg.news_impacts},
+                "upcoming": providers.upcoming(m.cfg, min(max(hours, 1), 168))}
+
+    @app.get("/api/market/feed", dependencies=[api])
+    def market_feed(m=Depends(mkt)):
+        return m.feed.status()
 
     # -- the app itself
 

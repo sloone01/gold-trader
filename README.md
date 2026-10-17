@@ -16,6 +16,12 @@ server/
   service.py      runs the engine loop in a thread, thread-safe calls for the API
   app.py          FastAPI routes (/api/...) + serves the web app, bearer-token auth
 web/              the phone app (PWA: vanilla JS, no build step)
+market/           Market Watch, built in (was the separate `trading` app)
+  providers.py    prices (MT5 candles for gold, Twelve Data, Yahoo, Binance, demo), news, economic calendar
+  indicators.py   SMA/EMA, RSI, MACD, Bollinger, ATR, ADX, swing support/resistance
+  signals.py      regime-aware composite score (-100..+100), confidence, buy/sell idea, EN/AR summary
+  calibrate.py    walk-forward weight calibration, saved in the database
+  service.py      background refresh per timeframe, flip alerts, the gold feed into Signals
 signals/
   parser.py       Claude turns a Telegram message into a structured signal
   mapper.py       signal + channel trust + preset rules -> trade plan (lot by weight, Far SL, P1-P3)
@@ -69,6 +75,14 @@ How a signal becomes a trade:
 - Each channel has a **scorecard** (signals, placed, win rate, pips, $) so you can raise or lower its weight as it proves itself. After 10 closed trades it suggests a direction.
 - **Try a message** on the Signals screen parses any text without trading, to check how a channel's style is read.
 
+### Markets (Market Watch, built in)
+
+The **Markets** tab is the former Market Watch app, now part of Gold Trader: gold, silver, oil, EUR/USD, GBP/USD, USD/JPY, Bitcoin and Ethereum on 5M / 15M / 1H / 4H / 1D, each with a composite score (−100…+100), confidence, regime, walk-forward hit rate, a buy/sell idea (entry, stop, target), indicators, an overlay chart, news sentiment and a plain-language summary, in English or Arabic.
+
+- Works with no keys (demo data, labelled). Gold uses the MT5 terminal's own candles, so the analysis sees the prices you trade at. Set `TWELVEDATA_API_KEY` and `MARKETAUX_API_KEY` for live metals/FX/oil and news; crypto comes from Binance.
+- **The gold idea is a channel.** On the feed timeframe (`MW_FEED_TIMEFRAME`, 4h), a gold buy/sell idea goes to **Signals** as the "Market Watch" channel: confirm mode at first, then auto once you trust it, with its own weight, preset and scorecard, and the engine manages it with P1–P3, trailing and your limits. A flip closes the trade and opens the other side; no entries during high-impact news.
+- Signal flips show up in the event feed, and optionally as Telegram bot messages (`MW_ALERT_BOT_TOKEN` / `MW_ALERT_CHAT_ID`).
+
 ### Feeds: signals from another app
 
 Another program can push structured signals instead of Telegram messages, and each sender is handled as a channel: it shows up in **Signals → Channels** with its own trust weight, mode, preset and scorecard, and its trades get the same P1–P3, trailing and risk limits. Market Watch (the `trading` repo) uses this for its gold ideas.
@@ -108,6 +122,9 @@ The token is the only lock on the door, so keep it long and private. Use a demo 
 | GET | /api/history · /api/events · /api/events/stream | closed trades · alert feed · SSE |
 | GET/POST/PUT/DELETE | /api/presets | presets |
 | GET/PUT | /api/limits | max lot, daily loss, max spread |
+| GET | /api/market?tf=4h · /api/market/assets/{id} | Markets snapshot · one asset |
+| POST | /api/market/refresh?tf= | refresh now (rate-limited) |
+| GET | /api/market/calendar · /api/market/feed | high-impact news · gold feed status |
 | POST | /api/feeds/{feed}/signals | structured signal from another app, handled as a channel (see Feeds) |
 
 ## Defaults (change in `engine/engine.py` or `.env`)
