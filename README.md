@@ -75,6 +75,13 @@ How a signal becomes a trade:
 - **Weight** sets the lot: lot = weight × 0.01 (configurable), so weight 1 trades 0.01 and weight 5 trades 0.05. **Mode** decides what happens: `auto` places the trade immediately, `confirm` waits in **Signals → Waiting for you** with a Place button (you can change the lot before placing), `off` pauses the channel.
 - The SL comes from the signal (Far mode). P1–P3 come from the signal's TP1–TP3 when it gives three (toggle), otherwise from the channel's preset. Close percentages, SL moves and trailing always come from the preset: our rules, their levels.
 - Follow-ups from the same channel ("close half", "SL to breakeven", "close now", new TP) are matched to the last trade placed from that channel and applied the same way (auto or confirm).
+- **Follow-ups go to the right trade:** a message that *replies* to a signal acts on that signal's trades; otherwise on the channel's latest signal. Every entry of a ladder gets the follow-up.
+- **Breakeven armor:** when the channel posts "TP1 hit ✅", its open trades' stop moves to breakeven (toggle in Channels → Rules).
+- **No stop in the signal?** It waits (90 s by default) for the channel's "SL ..." message and then enters with it; if none comes it enters with the default stop, or skips (your choice).
+- **Risk sizing:** instead of weight × 0.01 lot, size by risk: weight × 0.25% of the balance (configurable), with the lot worked out from the stop distance, so a wide stop trades smaller. The plan shows the $ at risk.
+- **Entry ladder (optional):** split the lot over 2–3 entries: the edges of a zone ("buy 2640-2650"), or deeper toward the stop. Entries wait for their price, are cancelled after a few hours, when the stop is hit first, or when the channel closes or reports a TP. **Buy/sell limit and stop orders** always wait for their price instead of entering at market.
+- **Your own signals:** type one on the Signals screen (it goes through the "My signals" channel), or follow Telegram's **Saved Messages** as a channel and forward signals there from WhatsApp or anywhere.
+- **Timeline:** every signal has a timeline page: the message, how it was read, the plan, each fill, the follow-ups and channel results, and every engine event on its trades.
 - Each channel has a **scorecard** (signals, placed, win rate, pips, $) so you can raise or lower its weight as it proves itself. After 10 closed trades it suggests a direction.
 - **Try a message** on the Signals screen parses any text without trading, to check how a channel's style is read.
 

@@ -5,27 +5,69 @@ from dataclasses import replace
 
 from engine.broker import Quote, SymbolInfo
 from engine.models import STOP_MODE_PIPS, Side, StepConfig, StopMode, TradeSettings
-from engine.units import PIP, floor_volume
+from engine.units import PIP, dollars, floor_volume
 
 from .models import MAX_WEIGHT, Channel, ParsedSignal, SignalSettings
 
 
-def lot_for(channel: Channel, cfg: SignalSettings, info: SymbolInfo) -> float:
-    """Lot by trust: weight x lot_per_weight (weight 1 -> 0.01, weight 5 -> 0.05 by default)."""
-    raw = cfg.lot_per_weight * max(1, min(channel.weight, MAX_WEIGHT))
-    return max(info.vol_min, floor_volume(raw, info.vol_step))
+def lot_for(channel: Channel, cfg: SignalSettings, info: SymbolInfo, sl_pips: float | None = None,
+            balance: float | None = None) -> tuple[float, float | None]:
+    """(lot, $ at risk). By trust weight: weight x lot_per_weight. By risk: weight x risk_pct_per_weight %
+    of the balance, divided by what the stop distance costs per lot."""
+    w = max(1, min(channel.weight, MAX_WEIGHT))
+    if cfg.sizing == "risk" and balance and sl_pips and sl_pips > 0:
+        money = balance * w * cfg.risk_pct_per_weight / 100
+        per_lot = dollars(sl_pips, 1.0, info.contract_size)
+        return max(info.vol_min, floor_volume(money / per_lot, info.vol_step)), round(money, 2)
+    lot = max(info.vol_min, floor_volume(cfg.lot_per_weight * w, info.vol_step))
+    return lot, (dollars(sl_pips, lot, info.contract_size) if sl_pips else None)
+
+
+def plan_legs(p: ParsedSignal, cfg: SignalSettings, lot: float, info: SymbolInfo) -> list[dict]:
+    """Entry legs: [{price (None = now), kind: market|limit|stop, lot}]. One leg unless the ladder is on
+    or the signal is a pending order."""
+    side = Side(p.side)
+    if p.order_type == "stop":                     # breakout: one entry once price gets there
+        return [{"price": p.entry, "kind": "stop", "lot": lot}]
+    n = max(1, min(int(cfg.ladder_legs), 3)) if cfg.ladder else 1
+    while n > 1 and floor_volume(lot / n, info.vol_step) < info.vol_min:
+        n -= 1                                     # too small to split
+    if p.entry is not None and p.entry_high is not None and p.entry_high != p.entry:
+        top, bottom = (p.entry_high, p.entry) if side is Side.BUY else (p.entry, p.entry_high)
+        prices = [top, (top + bottom) / 2, bottom][:n] if n == 3 else [top, bottom][:n] if n == 2 else [top]
+        kinds = ["limit"] * n                      # zone: each edge fills when price comes to it
+        if p.order_type == "market":
+            kinds[0] = "market"                    # first leg now (if price is at or better than the zone)
+    else:
+        first = p.entry if p.order_type == "limit" else None
+        prices, kinds = [first], ["limit" if first is not None else "market"]
+        if n > 1 and p.sl is not None:
+            ref = p.entry if p.entry is not None else None
+            if ref is not None:
+                depth = cfg.ladder_depth_pct / 100
+                for k in range(1, n):
+                    prices.append(round(ref - (ref - p.sl) * depth * k / (n - 1), 2))
+                    kinds.append("limit")
+    each = floor_volume(lot / len(prices), info.vol_step)
+    lots = [each] * len(prices)
+    lots[0] = round(lots[0] + floor_volume(lot - each * len(prices), info.vol_step), 8)   # leftovers on the first
+    # A market leg with a price (a zone's first edge) fills now if the market is at or better than it.
+    return [{"price": round(pr, 2) if pr is not None else None, "kind": k, "lot": l}
+            for pr, k, l in zip(prices, kinds, lots)]
 
 
 def build_plan(p: ParsedSignal, channel: Channel, preset: TradeSettings, cfg: SignalSettings,
-               quote: Quote, info: SymbolInfo) -> dict:
-    """Returns {side, settings(dict), lot, ref_price, errors[], warnings[]} for an "open" signal."""
+               quote: Quote, info: SymbolInfo, lot: float | None = None, balance: float | None = None,
+               max_lot: float | None = None, entry_at: float | None = None) -> dict:
+    """Returns {side, settings(dict), lot, ref_price, errors[], warnings[]} for an "open" signal.
+    lot: a fixed lot (one ladder leg); entry_at: plan as if entering at this price (a waiting leg)."""
     errors: list[str] = []
     warnings: list[str] = []
     side = Side(p.side)
     sign = side.sign
-    ref = quote.ask if side is Side.BUY else quote.bid      # we enter at market
+    ref = entry_at if entry_at is not None else (quote.ask if side is Side.BUY else quote.bid)
 
-    if p.entry is not None:
+    if p.entry is not None and entry_at is None and p.order_type == "market":
         lo, hi = p.entry, p.entry_high or p.entry
         if lo <= ref <= hi:
             drift = 0.0
@@ -69,13 +111,21 @@ def build_plan(p: ParsedSignal, channel: Channel, preset: TradeSettings, cfg: Si
             fixed.append(st)
     steps = fixed
 
-    lot = lot_for(channel, cfg, info)
+    risk_usd = None
+    if lot is None:
+        lot, risk_usd = lot_for(channel, cfg, info, sl_pips if sl_pips > 0 else None, balance)
+        if max_lot is not None and lot > max_lot + 1e-9:
+            warnings.append(f"Lot {lot:g} capped at your max lot {max_lot:g}")
+            lot = max_lot
+    if risk_usd is None and sl_pips > 0:
+        risk_usd = dollars(sl_pips, lot, info.contract_size)
     settings = TradeSettings(lot=lot, stop_mode=StopMode.FAR, sl_pips=sl_pips, tp_pips=tp_pips,
                              steps=steps, trailing=preset.trailing, trail_pips=preset.trail_pips)
     return {
         "side": side.value, "lot": lot, "ref_price": ref, "sl_price": p.sl, "tps": p.tps,
         "settings": _settings_dict(settings), "errors": errors, "warnings": warnings,
-        "weight": channel.weight, "preset_steps_used": steps is preset.steps,
+        "weight": channel.weight, "preset_steps_used": steps is preset.steps, "risk_usd": risk_usd,
+        "sizing": cfg.sizing,
     }
 
 

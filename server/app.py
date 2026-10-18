@@ -155,11 +155,24 @@ class SignalSettingsIn(BaseModel):
     max_entry_drift_pips: float
     default_sl_pips: float = 50.0
     model: str = "claude-opus-5"
+    sizing: str = "weight"
+    risk_pct_per_weight: float = 0.25
+    wait_for_sl_s: float = 90.0
+    no_sl_action: str = "default"
+    ladder: bool = False
+    ladder_legs: int = 3
+    ladder_depth_pct: float = 50.0
+    ladder_expiry_min: float = 240.0
+    be_on_tp_hit: bool = True
 
 
 class TestParseIn(BaseModel):
     text: str
     channel_id: int | None = None
+
+
+class OwnSignalIn(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
 
 
 class PlaceIn(BaseModel):
@@ -222,14 +235,18 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
             build_market(app.state.service, app.state.signals) if service is None else None)
         if run_loop:
             app.state.service.start()
+            if app.state.signals:
+                app.state.signals.start()
             if app.state.market:
                 app.state.market.start()
         yield
         app.state.service.stop()
         if app.state.market:
             app.state.market.stop()
-        if app.state.signals and app.state.signals.telegram:
-            app.state.signals.telegram.stop()
+        if app.state.signals:
+            app.state.signals.stop()
+            if app.state.signals.telegram:
+                app.state.signals.telegram.stop()
 
     app = FastAPI(title="Gold Trader", lifespan=lifespan)
 
@@ -417,6 +434,20 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     def test_signal(body: TestParseIn, s=Depends(sigs)):
         return s.test_parse(body.text, body.channel_id)
 
+    @app.post("/api/signals/own", dependencies=[api])
+    def own_signal(body: OwnSignalIn, s=Depends(sigs)):
+        """A signal you type yourself, read like a channel message (the "My signals" channel)."""
+        if s.parser is None:
+            raise HTTPException(503, "Reading messages needs ANTHROPIC_API_KEY")
+        sig = s.own_signal(body.text)
+        if sig is None:
+            raise HTTPException(400, "The My signals channel is off")
+        return sig.to_dict()
+
+    @app.get("/api/signals/{signal_id}/timeline", dependencies=[api])
+    def signal_timeline(signal_id: int, s=Depends(sigs)):
+        return s.timeline(signal_id)
+
     @app.post("/api/signals/{signal_id}/place", dependencies=[api])
     def place_signal(signal_id: int, body: PlaceIn | None = None, s=Depends(sigs)):
         return s.place(signal_id, body.lot if body else None).to_dict()
@@ -447,7 +478,10 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     @app.put("/api/signals/settings", dependencies=[api])
     def set_signal_settings(body: SignalSettingsIn, s=Depends(sigs)):
         from signals import SignalSettings
-        return s.set_settings(SignalSettings(**body.model_dump())).to_dict()
+        try:
+            return s.set_settings(SignalSettings(**body.model_dump())).to_dict()
+        except ValueError as ex:
+            raise HTTPException(400, str(ex))
 
     @app.get("/api/channels", dependencies=[api])
     def channels(s=Depends(sigs)):

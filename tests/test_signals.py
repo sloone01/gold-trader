@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -167,7 +169,12 @@ def test_topic_filter(env):
 def test_missing_sl_falls_back_to_preset_and_watch_is_recorded(env):
     client, trading, sigs, broker = env
     sigs.save_channel(Channel(CH, "Gold VIP", weight=5, mode="auto"))
+    sigs.cfg.wait_for_sl_s = 0.01
     sig = sigs.handle_message(CH, "Gold VIP", 1, "GOLD BUY no sl 2650 TP 2660")
+    assert sig.status == "waiting_sl"                                # waits for the channel's stop first
+    time.sleep(0.02)
+    sigs.tick()
+    sig = sigs._get(sig.id)
     assert sig.status == "placed", sig.error
     t = trading.store.trades[sig.ticket]
     assert t.settings.sl_pips == 50.0 and t.sl == 2645.30            # default 50 pips until the channel gives a stop

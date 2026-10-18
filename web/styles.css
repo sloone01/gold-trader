@@ -148,3 +148,17 @@ table input { padding: 7px 8px; margin: 0; }
 .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
 #view[dir=rtl] .back, #view[dir=rtl] h1 { text-align: right; }
 @media (max-width: 480px) { .grid3 .mw-tri { padding: 8px; } .grid3:has(.mw-tri) { grid-template-columns: 1fr; } }
+
+/* signals: ladder legs and timeline */
+.legs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.leg { font-size: 0.78em; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.leg.placed { color: var(--buy); border-color: var(--buy); }
+.leg.failed { color: var(--sell); border-color: var(--sell); }
+.timeline { padding: 4px 14px; }
+.tl-item { display: grid; grid-template-columns: 92px 1fr; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.tl-item:last-child { border-bottom: 0; }
+.tl-item .t { color: var(--muted); font-size: 0.78em; font-variant-numeric: tabular-nums; }
+.tl-item.opened .small, .tl-item.step_hit .small { color: var(--buy); }
+.tl-item.closed .small { color: var(--gold); }
+.tl-item.error .small { color: var(--sell); }
+.tl-item.sl_moved .small { color: var(--blue); }

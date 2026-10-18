@@ -100,7 +100,8 @@ class TelegramListener:
         return fut.result(timeout=30)
 
     async def _dialogs(self, limit: int) -> list[dict]:
-        out = []
+        # Saved Messages: follow it to trade signals you post or forward there yourself.
+        out = [{"id": self.me.id, "title": "Saved Messages (you)", "kind": "saved", "username": None, "forum": False}]
         async for d in self.client.iter_dialogs(limit=limit):
             if d.is_channel or d.is_group:
                 out.append({"id": _norm_id(d.id), "title": d.name, "kind": "channel" if d.is_channel and not d.is_group else "group",

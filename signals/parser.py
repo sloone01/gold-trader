@@ -23,7 +23,8 @@ Rules:
   ("buy 2650-2655": entry = low, entry_high = high), or missing (market). Collect the stop loss
   as sl and every take-profit as tps in the order given ("TP1 2660, TP2 2670" -> [2660, 2670]).
   If TPs are given as "+20 pips" style distances, leave tps empty and explain in reason.
-  Pending orders ("buy limit", "sell stop") are still "open"; note the order type in reason.
+  Pending orders are still "open": set order_type "limit" ("buy limit 2640", "sell limit") or "stop"
+  ("buy stop 2670", "sell stop") and entry to the order price. A plain buy/sell now is order_type "market".
 - action "close": close the whole running trade ("close now", "exit", "take full profit").
 - action "close_partial": close part of it; close_pct is the percentage if stated ("close half" -> 50),
   else null.
@@ -68,6 +69,7 @@ class SignalOut(BaseModel):
     result: str | None = Field(default=None, description="for action result: tp | sl | be | pips")
     result_pips: float | None = None
     result_tp: int | None = None
+    order_type: str = Field(default="market", description="market | limit | stop")
     confidence: float = 0.0
     reason: str = ""
 
@@ -144,4 +146,7 @@ def normalise(p: ParsedSignal) -> ParsedSignal:
     if p.entry is not None and p.entry_high is not None and p.entry_high < p.entry:
         p.entry, p.entry_high = p.entry_high, p.entry
     p.tps = [float(t) for t in p.tps if t]
+    p.order_type = (p.order_type or "market").lower()
+    if p.order_type not in ("market", "limit", "stop") or p.entry is None:
+        p.order_type = "market"
     return p

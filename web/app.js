@@ -124,7 +124,7 @@
     S.route = route || "home";
     S.param = param || null;
     if (S.route === "trade" && !S.form) S.form = null;
-    const tab = { detail: "home", channels: "signals", presets: "settings", asset: "markets" }[S.route] || S.route;
+    const tab = { detail: "home", channels: "signals", presets: "settings", asset: "markets", signal: "signals" }[S.route] || S.route;
     document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("on", a.dataset.tab === tab));
     S.detailEdit = {};
     render();
@@ -136,6 +136,7 @@
     try {
       switch (S.route) {
         case "markets": return await renderMarkets();
+        case "signal": return await renderTimeline();
         case "asset": return await renderAsset();
         case "home": return renderHome();
         case "trade": return renderTradeForm();
@@ -533,14 +534,20 @@
   }
 
   // ---------------------------------------------------------------- signals
-  const STATUS_CLS = { pending: "warn", placed: "pos", applied: "pos", failed: "neg", ignored: "muted", dismissed: "muted", new: "muted", watch: "warn", result: "muted" };
+  const STATUS_CLS = { pending: "warn", placed: "pos", applied: "pos", failed: "neg", ignored: "muted", dismissed: "muted", new: "muted", watch: "warn", result: "muted", waiting_sl: "warn", armed: "warn", expired: "muted" };
 
   function planSummary(sig, digits) {
     const p = sig.parsed || {}, plan = sig.plan || {};
-    if (plan.action) return `${plan.action.replace("_", " ")} on #${plan.ticket}${plan.close_pct ? ` (${plan.close_pct}%)` : ""}${plan.sl_pips != null ? ` → SL ${fmt.pips(plan.sl_pips)} pips` : ""}${plan.tp_pips != null ? ` → TP +${plan.tp_pips} pips` : ""}`;
+    if (plan.action) {
+      const on = (plan.tickets || (plan.ticket ? [plan.ticket] : [])).map((t) => "#" + t).join(", ") || "waiting entries";
+      const sl = plan.sl === "breakeven" ? " → SL to breakeven" : plan.sl != null ? ` → SL ${plan.sl}` : plan.sl_pips != null ? ` → SL ${fmt.pips(plan.sl_pips)} pips` : "";
+      return `${plan.action.replace("_", " ")} on ${on}${plan.close_pct ? ` (${plan.close_pct}%)` : ""}${sl}${plan.tp != null ? ` → TP ${plan.tp}` : plan.tp_pips != null ? ` → TP +${plan.tp_pips} pips` : ""}`;
+    }
     if (!plan.settings) return p.reason || "";
-    const s = plan.settings;
-    return `${plan.side.toUpperCase()} ${fmt.lot(plan.lot)} lot @ market ${fmt.price(plan.ref_price, digits)} · SL ${plan.sl_price} (${s.sl_pips} pips) · P ${s.steps.map((x) => "+" + x.pips).join(" / ")}${s.tp_pips ? ` · TP +${s.tp_pips}` : ""}`;
+    const s = plan.settings, legs = plan.legs || [];
+    const entry = legs.length > 1 ? `${legs.length} entries (${legs.map((l) => l.price == null ? "now" : l.price).join(" / ")})`
+      : legs[0] && legs[0].kind !== "market" ? `${legs[0].kind} @ ${legs[0].price}` : `@ market ${fmt.price(plan.ref_price, digits)}`;
+    return `${plan.side.toUpperCase()} ${fmt.lot(plan.lot)} lot ${entry} · SL ${plan.sl_price ?? "default"} (${s.sl_pips} pips)${plan.risk_usd != null ? ` · risk ${fmt.usd(-plan.risk_usd)}` : ""} · P ${s.steps.map((x) => "+" + x.pips).join(" / ")}${s.tp_pips ? ` · TP +${s.tp_pips}` : ""}`;
   }
 
   function signalCard(sig, digits) {
@@ -557,11 +564,14 @@
       ${p.action && p.action !== "ignore" && p.action !== "watch" && p.action !== "result" ? `<div class="small"><b>${p.action.replace("_", " ")}</b>${p.confidence ? ` <span class="muted">(${Math.round(p.confidence * 100)}% sure)</span>` : ""} — ${esc(planSummary(sig, digits))}</div>` : ""}
       ${(sig.plan?.warnings || []).map((w) => `<div class="warn small">${esc(w)}</div>`).join("")}
       ${sig.error ? `<div class="${sig.status === "ignored" ? "muted" : "error"} small">${esc(sig.error)}</div>` : ""}
+      ${sig.note ? `<div class="small" style="color:var(--blue)">${esc(sig.note)}</div>` : ""}
+      ${(sig.plan?.legs || []).length > 1 || (sig.plan?.legs?.[0]?.kind ?? "market") !== "market" ? `<div class="legs">${sig.plan.legs.map((l, i) => `<span class="leg ${l.status}">E${i + 1} ${l.price == null ? "now" : l.price} · ${fmt.lot(l.lot)} · ${l.status}${l.ticket ? " #" + l.ticket : ""}</span>`).join("")}</div>` : ""}
+      ${!pending && (sig.status === "waiting_sl" || (sig.plan?.legs || []).some((l) => l.status === "waiting")) ? `<div class="btns"><button class="ghost sm" data-dismiss="${sig.id}">${sig.status === "waiting_sl" ? "Cancel" : "Cancel waiting entries"}</button></div>` : ""}
       ${pending ? `<div class="btns">
         ${sig.plan?.settings ? `<input type="number" step="0.01" min="0.01" data-lot="${sig.id}" value="${sig.plan.lot}" style="flex:0 0 90px;margin:0" title="lot">` : ""}
         <button class="primary" data-place="${sig.id}">${sig.plan?.action ? "Apply" : "Place trade"}</button>
         <button class="ghost" data-dismiss="${sig.id}">Dismiss</button></div>` : ""}
-      ${sig.ticket && sig.status !== "pending" ? `<div class="small" style="margin-top:6px"><a href="#/detail/${sig.ticket}">Open trade #${sig.ticket} →</a></div>` : ""}
+      <div class="row" style="margin-top:6px;gap:14px">${sig.ticket && sig.status !== "pending" ? `<a class="small" href="#/detail/${sig.ticket}">Trade #${sig.ticket} →</a>` : ""}${p.action && p.action !== "ignore" ? `<a class="small" href="#/signal/${sig.id}">Timeline →</a>` : ""}</div>
     </div>`;
   }
 
@@ -576,8 +586,9 @@
     const digits = S.status?.info?.digits ?? 2;
     const tg = st.telegram;
     const pending = sigs.filter((s) => s.status === "pending").reverse();
+    const working = sigs.filter((s) => s.status === "waiting_sl" || s.status === "armed").reverse();
     const watching = sigs.filter((s) => s.status === "watch" && s.ts > Date.now() / 1000 - 86400).reverse();
-    const rest = sigs.filter((s) => s.status !== "pending" && s.status !== "watch").reverse();
+    const rest = sigs.filter((s) => !["pending", "watch", "waiting_sl", "armed"].includes(s.status)).reverse();
     view.innerHTML = `
       <div class="row between"><h1>Signals</h1><a href="#/channels"><button class="sm">Channels (${chans.length})</button></a></div>
       <div class="small ${tg ? (tg.connected ? "pos" : "neg") : "warn"}" style="margin-bottom:10px">
@@ -585,7 +596,14 @@
       </div>
       <h2>Waiting for you (${pending.length})</h2>
       ${pending.length ? pending.map((s) => signalCard(s, digits)).join("") : `<div class="card empty small">Nothing to confirm.</div>`}
+      ${working.length ? `<h2>Waiting for price or stop (${working.length})</h2>${working.map((s) => signalCard(s, digits)).join("")}` : ""}
       ${watching.length ? `<h2>Setups to watch (last 24h)</h2>${watching.map((s) => signalCard(s, digits)).join("")}` : ""}
+      <h2>Your own signal</h2>
+      <div class="card">
+        <textarea id="sig-own" rows="2" placeholder="e.g. buy gold 2650 sl 2640 tp 2660 2670 — handled as the My signals channel (its mode decides: confirm or auto)" style="width:100%;margin-top:0;padding:10px;font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:10px"></textarea>
+        <div class="btns"><button class="primary" id="sig-own-btn">Send</button></div>
+        <div class="small muted">You can also follow Telegram's <b>Saved Messages</b> as a channel and forward signals there from WhatsApp or anywhere.</div>
+      </div>
       <h2>Try a message</h2>
       <div class="card">
         <textarea id="sig-test" rows="3" placeholder="Paste a signal message to see how it would be read and traded (nothing is placed)" style="width:100%;margin-top:0;padding:10px;font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:10px"></textarea>
@@ -602,6 +620,15 @@
       if (r.status === "failed") throw new Error(r.error || "Failed");
     })));
     view.querySelectorAll("[data-dismiss]").forEach((b) => b.addEventListener("click", act(() => api(`/signals/${b.dataset.dismiss}/dismiss`, { method: "POST" }))));
+    $("#sig-own-btn").addEventListener("click", async () => {
+      const text = $("#sig-own").value.trim();
+      if (!text) return;
+      try {
+        const r = await api("/signals/own", { method: "POST", body: { text } });
+        toast(`My signals: ${r.status}${r.error ? " · " + r.error : ""}`, r.status === "failed" ? "error" : "info");
+        renderSignals(); refreshStatus();
+      } catch (e) { fail(e); }
+    });
     $("#sig-test-btn").addEventListener("click", async () => {
       const text = $("#sig-test").value.trim();
       if (!text) return;
@@ -620,6 +647,25 @@
         </div>`;
       } catch (e) { out.innerHTML = ""; fail(e); }
     });
+  }
+
+  // --------------------------------------------------------------- timeline
+  async function renderTimeline() {
+    const tl = await api(`/signals/${S.param}/timeline`);
+    const digits = S.status?.info?.digits ?? 2;
+    const sig = tl.signal, items = [];
+    items.push({ ts: sig.ts, kind: "msg", html: `<b>${esc(sig.channel_title)}</b><div class="muted" style="white-space:pre-wrap">${esc(sig.text)}</div>` });
+    const p = sig.parsed || {};
+    if (p.action) items.push({ ts: sig.ts + 1e-6, kind: "read", html: `<b>Read as</b> ${esc(p.action)} ${p.side ? p.side.toUpperCase() : ""} ${p.order_type && p.order_type !== "market" ? esc(p.order_type) : ""} · entry ${p.entry ?? "market"}${p.entry_high ? "–" + p.entry_high : ""} · SL ${p.sl ?? "—"} · TP ${(p.tps || []).join(", ") || "—"}` });
+    if (sig.plan?.settings) items.push({ ts: sig.ts + 2e-6, kind: "plan", html: `<b>Plan</b> ${esc(planSummary(sig, digits))}${sig.note ? `<div style="color:var(--blue)">${esc(sig.note)}</div>` : ""}` });
+    for (const f of tl.followups) items.push({ ts: f.ts, kind: "msg", html: `<b>${esc(f.channel_title)}</b> <span class="small ${STATUS_CLS[f.status] || ""}">${esc(f.status)}</span><div class="muted" style="white-space:pre-wrap">${esc(f.text)}</div>${f.plan?.action ? `<div>→ ${esc(planSummary(f, digits))}</div>` : ""}${f.note ? `<div style="color:var(--blue)">${esc(f.note)}</div>` : ""}${f.error ? `<div class="error">${esc(f.error)}</div>` : ""}` });
+    for (const e of tl.events) items.push({ ts: e.ts, kind: e.kind, html: `<b>#${e.ticket}</b> ${esc(e.message)}` });
+    items.sort((a, b) => a.ts - b.ts);
+    view.innerHTML = `<a class="back" href="#/signals">← Signals</a><h1>Signal #${sig.id} · ${esc(sig.status)}</h1>
+      ${tl.trades.map((t) => tradeCard(t)).join("")}
+      <h2>Conversation</h2>
+      <div class="card timeline">${items.map((it) => `<div class="tl-item ${it.kind}"><span class="t">${fmt.date(it.ts)}</span><div class="small">${it.html}</div></div>`).join("")}</div>`;
+    view.querySelectorAll("[data-go]").forEach((el) => el.addEventListener("click", () => (location.hash = el.dataset.go)));
   }
 
   // --------------------------------------------------------------- channels
@@ -659,6 +705,26 @@
         </div>
         <div class="inline"><input type="checkbox" id="c-tps" ${cfg.use_signal_tps ? "checked" : ""}><label for="c-tps" style="margin:0;color:var(--text)">Use the signal's TP1–TP3 as P1–P3 distances (when it gives three)</label></div>
         <div class="inline"><input type="checkbox" id="c-final" ${cfg.final_tp ? "checked" : ""}><label for="c-final" style="margin:0;color:var(--text)">Also set the signal's last TP as a hard take profit</label></div>
+        <h3 style="margin-top:16px">Sizing</h3>
+        <div class="grid2">
+          <label>Lot size by<select id="c-sizing"><option value="weight" ${cfg.sizing === "weight" ? "selected" : ""}>Trust weight × lot per point</option><option value="risk" ${cfg.sizing === "risk" ? "selected" : ""}>Risk % of balance (from the stop)</option></select></label>
+          <label>Risk % per trust point<input type="number" step="0.05" min="0.05" id="c-riskpct" value="${cfg.risk_pct_per_weight}"></label>
+        </div>
+        <h3 style="margin-top:16px">Signals without a stop</h3>
+        <div class="grid2">
+          <label>Wait for the channel's SL (seconds, 0 = don't wait)<input type="number" step="15" min="0" id="c-wait" value="${cfg.wait_for_sl_s}"></label>
+          <label>If no SL comes<select id="c-nosl"><option value="default" ${cfg.no_sl_action === "default" ? "selected" : ""}>Enter with the default SL</option><option value="skip" ${cfg.no_sl_action === "skip" ? "selected" : ""}>Skip the signal</option></select></label>
+        </div>
+        <h3 style="margin-top:16px">Entry ladder</h3>
+        <div class="inline"><input type="checkbox" id="c-ladder" ${cfg.ladder ? "checked" : ""}><label for="c-ladder" style="margin:0;color:var(--text)">Split entries: zone edges, or deeper toward the stop (better average price)</label></div>
+        <div class="grid3">
+          <label>Entries<select id="c-legs">${[2, 3].map((n) => `<option ${n === cfg.ladder_legs ? "selected" : ""}>${n}</option>`).join("")}</select></label>
+          <label>Deepest at % to SL<input type="number" step="5" min="10" max="90" id="c-depth" value="${cfg.ladder_depth_pct}"></label>
+          <label>Cancel unfilled after (min)<input type="number" step="30" min="5" id="c-expiry" value="${cfg.ladder_expiry_min}"></label>
+        </div>
+        <div class="small muted">Buy/sell limit and stop orders always wait for their price, ladder or not.</div>
+        <h3 style="margin-top:16px">Breakeven armor</h3>
+        <div class="inline"><input type="checkbox" id="c-armor" ${cfg.be_on_tp_hit ? "checked" : ""}><label for="c-armor" style="margin:0;color:var(--text)">When the channel posts "TP1 hit", move its trades' stop to breakeven</label></div>
         <button class="wide primary" id="c-save">Save rules</button>
       </div>
       <h2>Followed channels (${chans.length})</h2>
@@ -687,7 +753,11 @@
       try {
         await api("/signals/settings", { method: "PUT", body: { lot_per_weight: Number($("#c-lot").value),
           max_entry_drift_pips: Number($("#c-drift").value), default_sl_pips: Number($("#c-dsl").value), model: $("#c-model").value.trim() || "claude-opus-5",
-          use_signal_tps: $("#c-tps").checked, final_tp: $("#c-final").checked } });
+          use_signal_tps: $("#c-tps").checked, final_tp: $("#c-final").checked,
+          sizing: $("#c-sizing").value, risk_pct_per_weight: Number($("#c-riskpct").value),
+          wait_for_sl_s: Number($("#c-wait").value), no_sl_action: $("#c-nosl").value,
+          ladder: $("#c-ladder").checked, ladder_legs: Number($("#c-legs").value), ladder_depth_pct: Number($("#c-depth").value),
+          ladder_expiry_min: Number($("#c-expiry").value), be_on_tp_hit: $("#c-armor").checked } });
         reload("Rules saved");
       } catch (e) { fail(e); }
     });
