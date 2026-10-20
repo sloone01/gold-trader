@@ -369,6 +369,9 @@ class AutoTrader:
         c = self.cfg
         if not c.enabled or snap["timeframe"]["id"] != c.timeframe:
             return
+        if getattr(getattr(self.market, "trading", None), "automation_paused", False):
+            self.mode = "paused"
+            return
         self.last_run, self.error = time.time(), None
         intents = sorted(filter(None, (self.intent(a) for a in snap["assets"])),
                          key=lambda i: (-i["confidence"], -abs(i["score"])))[:c.max_positions]

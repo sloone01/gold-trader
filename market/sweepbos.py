@@ -156,6 +156,9 @@ class SweepBos:
     def run(self) -> None:
         if not self.cfg.enabled:
             return
+        if getattr(getattr(self.market, "trading", None), "automation_paused", False):
+            self.watching = {a: "automatic trading paused" for a in self.cfg.assets}
+            return
         self.last_run, self.error = time.time(), None
         from . import providers as pv
         positions = []

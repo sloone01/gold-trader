@@ -89,6 +89,7 @@
     if (!st) return;
     setConn(st.connected && st.engine.last_tick > Date.now() / 1000 - 5);
     $("#sym").textContent = st.symbol;
+    document.querySelector('#tabs a[data-tab="markets"]')?.classList.toggle("hidden", !st.features?.markets);
     const q = st.quote;
     $("#quote").innerHTML = q ? `${fmt.price(q.bid, st.info.digits)}<small>${q.spread_pips} pip</small>` : "no quote";
   }
@@ -170,6 +171,7 @@
         <div>TP</div><div>${t.tp == null ? "none" : `${fmt.price(t.tp, d)} <span class="muted">(${fmt.pips(t.tp_pips)})</span>`}</div>
       </div>
       <div class="steps">${steps}</div>
+      ${t.settings.be_trigger_pips ? `<div class="small ${t.be_done ? "pos" : "muted"}" style="margin-top:6px">Breakeven at +${t.settings.be_trigger_pips} (lock +${t.settings.be_lock_pips})${t.be_done ? " · done" : ""}${t.settings.hold_seconds ? ` · hold ${t.settings.hold_seconds}s` : ""}</div>` : t.settings.hold_seconds ? `<div class="small muted" style="margin-top:6px">Steps hold ${t.settings.hold_seconds}s</div>` : ""}
       ${t.settings.trailing && t.steps[2].status === "hit" ? `<div class="small muted" style="margin-top:6px">Trailing every ${t.settings.trail_pips} pips · ${t.trail_k} move${t.trail_k === 1 ? "" : "s"}</div>` : ""}
     </div>`;
   }
@@ -186,6 +188,7 @@
         <div class="stat"><div class="label">Today</div><div class="value ${fmt.cls(st.today_usd)}">${fmt.usd(st.today_usd)}</div></div>
         <div class="stat"><div class="label">Floating</div><div class="value ${fmt.cls(st.floating_usd)}">${fmt.usd(st.floating_usd)}</div></div>
       </div>
+      ${st.automation_paused ? `<div class="card small warn"><b>Automatic trading is paused.</b> Signals wait for your tap; open trades are still managed. <a href="#/settings">Resume in Settings</a></div>` : ""}
       ${!st.market_open ? `<p class="warn">Market closed: new trades are blocked.</p>` : ""}
       ${st.engine.last_error ? `<p class="error">Engine error: ${esc(st.engine.last_error)}</p>` : ""}
       ${st.engine.sim ? `<p class="warn">Simulator mode: no real money.</p>` : ""}
@@ -213,7 +216,7 @@
   function eventsHtml() {
     const evs = S.events.slice(-20).reverse();
     if (!evs.length) return `<div class="empty small">Nothing yet.</div>`;
-    return evs.map((e) => `<div class="event ${e.kind}"><span class="t">${fmt.time(e.ts)}</span><span class="m">#${e.ticket} ${esc(e.message)}</span></div>`).join("");
+    return evs.map((e) => `<div class="event ${e.kind}"><span class="t">${fmt.time(e.ts)}</span><span class="m">${e.ticket ? "#" + e.ticket + " " : ""}${esc(e.message)}</span></div>`).join("");
   }
 
   // ------------------------------------------------------------- trade form
@@ -246,7 +249,14 @@
       <table><thead><tr><th>Step</th><th>Trigger +pips</th><th>Close %</th><th>Move SL to +pips</th></tr></thead><tbody>${steps}</tbody></table>
       <div class="small muted" style="margin-top:6px">Move SL: 0 = breakeven, blank = don't move.</div>
       <div class="inline"><input type="checkbox" id="${prefix}-trail" ${s.trailing ? "checked" : ""}><label for="${prefix}-trail" style="margin:0;color:var(--text)">Trail after P3 every</label>
-        <input type="number" step="10" min="1" id="${prefix}-trailpips" value="${s.trail_pips}" style="width:90px;margin:0"><span>pips</span></div>`;
+        <input type="number" step="10" min="1" id="${prefix}-trailpips" value="${s.trail_pips}" style="width:90px;margin:0"><span>pips</span></div>
+      <h2>Breakeven & noise filter</h2>
+      <div class="grid3">
+        <label>Breakeven at +pips<input type="number" step="5" min="1" id="${prefix}-betrig" value="${s.be_trigger_pips ?? ""}" placeholder="off"></label>
+        <label>Lock +pips<input type="number" step="1" min="0" id="${prefix}-belock" value="${s.be_lock_pips ?? 1}"></label>
+        <label>Hold (seconds)<input type="number" step="5" min="0" max="3600" id="${prefix}-hold" value="${s.hold_seconds ?? 0}"></label>
+      </div>
+      <div class="small muted" style="margin-top:6px">Breakeven moves the stop to entry + lock once profit reaches the trigger, on its own, whatever P1 does (leave P1's "Move SL" blank so a quick +20 doesn't put you at breakeven). Hold: a step or the breakeven only fires after price stays past its level this many seconds, so spikes don't trigger it.</div>`;
   }
 
   function readSettings(root, prefix = "f") {
@@ -263,6 +273,9 @@
       })),
       trailing: $(`#${prefix}-trail`, root).checked,
       trail_pips: Number($(`#${prefix}-trailpips`, root).value),
+      be_trigger_pips: num($(`#${prefix}-betrig`, root).value),
+      be_lock_pips: Number($(`#${prefix}-belock`, root).value || 0),
+      hold_seconds: Number($(`#${prefix}-hold`, root).value || 0),
     };
   }
 
@@ -528,7 +541,7 @@
     view.innerHTML = `<div class="row between"><h1>Presets</h1><a href="#/presets/new"><button class="sm primary">+ New</button></a></div>
       ${S.presets.map((p) => `<div class="card clickable" data-go="#/presets/${p.id}">
         <div class="row between"><h3>${esc(p.name)}</h3><span class="muted small">${fmt.lot(p.settings.lot)} lot · ${p.settings.stop_mode}${p.settings.sl_pips ? " " + p.settings.sl_pips : ""}</span></div>
-        <div class="small muted" style="margin-top:4px">${p.settings.steps.map((s, i) => `P${i + 1} +${s.pips}${s.close_pct ? ` ×${s.close_pct}%` : ""}${s.move_sl_pips == null ? "" : s.move_sl_pips === 0 ? " BE" : ` →+${s.move_sl_pips}`}`).join(" · ")}${p.settings.tp_pips ? ` · TP +${p.settings.tp_pips}` : ""}${p.settings.trailing ? ` · trail ${p.settings.trail_pips}` : ""}</div>
+        <div class="small muted" style="margin-top:4px">${p.settings.steps.map((s, i) => `P${i + 1} +${s.pips}${s.close_pct ? ` ×${s.close_pct}%` : ""}${s.move_sl_pips == null ? "" : s.move_sl_pips === 0 ? " BE" : ` →+${s.move_sl_pips}`}`).join(" · ")}${p.settings.tp_pips ? ` · TP +${p.settings.tp_pips}` : ""}${p.settings.trailing ? ` · trail ${p.settings.trail_pips}` : ""}${p.settings.be_trigger_pips ? ` · BE at +${p.settings.be_trigger_pips} (+${p.settings.be_lock_pips})` : ""}${p.settings.hold_seconds ? ` · hold ${p.settings.hold_seconds}s` : ""}</div>
       </div>`).join("")}`;
     view.querySelectorAll("[data-go]").forEach((el) => el.addEventListener("click", () => (location.hash = el.dataset.go)));
   }
@@ -820,6 +833,11 @@
     const L = await api("/limits");
     const st = S.status;
     view.innerHTML = `<h1>Settings</h1>
+      <h2>Automatic trading</h2>
+      <div class="card">
+        <div class="row between"><div><b>${st?.automation_paused ? "Paused" : "On"}</b><div class="small muted">When paused, nothing opens or changes a trade by itself: auto channels wait for your tap, waiting entries stand still, the Markets auto-trader stops. P1–P3, breakeven and trailing on open trades keep running.</div></div></div>
+        <button class="wide ${st?.automation_paused ? "primary" : "danger"}" id="auto-toggle">${st?.automation_paused ? "Resume automatic trading" : "Pause all automatic trading"}</button>
+      </div>
       <h2>Risk limits</h2>
       <div class="card">
         <div class="grid2">
@@ -848,6 +866,12 @@
         <p class="small muted">Alerts show while the app is open or in the background. Install the app from your browser menu ("Add to Home screen") for a full-screen experience.</p>
         <button class="wide danger" id="logout">Disconnect (forget token)</button>
       </div>`;
+    $("#auto-toggle").addEventListener("click", async () => {
+      try {
+        await api("/automation", { method: "PUT", body: { paused: !S.status?.automation_paused } });
+        await refreshStatus(); renderSettings();
+      } catch (e) { fail(e); }
+    });
     $("#l-save").addEventListener("click", async () => {
       try {
         await api("/limits", { method: "PUT", body: { max_lot: Number($("#l-lot").value),

@@ -50,6 +50,13 @@ class TradeSettings:
     ])
     trailing: bool = True
     trail_pips: float = 50.0
+    # Breakeven rule, separate from the steps: once profit reaches be_trigger_pips, the stop moves to
+    # entry + be_lock_pips. None = off (the steps' own "SL to" moves still apply).
+    be_trigger_pips: float | None = None
+    be_lock_pips: float = 1.0
+    # Hold time: a step (or the breakeven rule) only fires after profit has stayed past its level
+    # this many seconds, so a quick spike doesn't trigger it. 0 = fire at once.
+    hold_seconds: float = 0.0
 
     def effective_sl_pips(self) -> float | None:
         if self.stop_mode is StopMode.FAR:
@@ -96,6 +103,7 @@ class Trade:
     tp: float | None
     steps: list[StepState]
     trail_k: int = 0       # number of trailing moves done after P3
+    be_done: bool = False  # the breakeven rule has moved the stop
     open: bool = True
     opened_at: float = 0.0
     closed_at: float | None = None

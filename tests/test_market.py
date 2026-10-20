@@ -50,7 +50,7 @@ def env(tmp_path):
     broker = SimBroker(bid=BID)
     trading = TradingService(broker, SqliteStore(tmp_path / "m.db"), sim_walk=False)
     sigs = SignalService(trading, None)
-    cfg = MarketConfig(news_filter=False, feed_tp_rs=[1, 2, 3], feed_min_confidence=0, feed_min_score=0)
+    cfg = MarketConfig(news_filter=False, feed=True, feed_tp_rs=[1, 2, 3], feed_min_confidence=0, feed_min_score=0)
     feed = FakeFeed()
     mkt = MarketService(cfg, trading, sigs, fetch=feed)
     app = create_app(trading, token=TOKEN, run_loop=False, signals=sigs, market=mkt)

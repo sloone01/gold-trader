@@ -169,3 +169,22 @@ def test_own_signals_and_timeline(env):
     tl = client.get(f"/api/signals/{sid}/timeline").json()
     assert tl["signal"]["id"] == sid and [f["status"] for f in tl["followups"]] == ["applied"]
     assert tl["trades"][0]["ticket"] == placed["ticket"] and any("SL moved" in e["message"] for e in tl["events"])
+
+
+def test_master_pause_stops_automatic_trading(env):
+    client, trading, sigs, broker, m = env
+    m["buy"] = buy()
+    m["limit"] = buy(entry=2640.0, sl=2630.0, order_type="limit")
+    assert client.put("/api/automation", json={"paused": True}).json() == {"paused": True}
+    assert client.get("/api/status").json()["automation_paused"] is True
+    sig = sigs.handle_message(CH, "Gold VIP", 1, "buy")              # auto channel, but paused
+    assert sig.status == "pending" and trading.store.open_trades() == []
+    client.put("/api/automation", json={"paused": False})
+    assert sigs.handle_message(CH, "Gold VIP", 2, "limit").status == "armed"
+    client.put("/api/automation", json={"paused": True})
+    walk(trading, broker, 2639.0)
+    sigs.tick()                                                       # entry price reached, but paused
+    assert trading.store.open_trades() == []
+    client.put("/api/automation", json={"paused": False})
+    sigs.tick()
+    assert len(trading.store.open_trades()) == 1

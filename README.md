@@ -142,6 +142,16 @@ The token is the only lock on the door, so keep it long and private. Use a demo 
 | GET | /api/market/autotrade · /api/market/performance?days=7&strategy=main\|sweepbos | auto-trader / Sweep+BOS status · closed-trade stats |
 | POST | /api/feeds/{feed}/signals | structured signal from another app, handled as a channel (see Feeds) |
 
+### Breakeven rule and hold time (in every preset)
+
+- **Breakeven at +X pips (lock +Y):** moves the stop to entry + Y once profit reaches X, separately from the steps. Leave P1's "Move SL" blank and P1 still takes profit at +20, but the rest of the trade keeps its stop through a normal pullback; it only goes to breakeven once the move has gone further.
+- **Hold (seconds):** a step or the breakeven rule fires only after price has stayed past its level this long, so a 1-second spike to +20 doesn't trigger it.
+- The built-in **"Hold the runner"** preset (new installs) shows it: P1 +20 closes half without moving the stop, breakeven +5 at +40, 15 s hold.
+
+### Pausing automatic trading
+
+**Settings → Automatic trading → Pause** stops everything that would open or change a trade by itself: auto channels wait for your tap, waiting ladder/limit entries stand still, breakeven-on-"TP1 hit" waits, the Markets auto-trader and Sweep+BOS stop. P1–P3, breakeven and trailing on trades already open keep running. Markets is off unless `MW_ENABLED=true` (the tab is hidden while it's off).
+
 ## Defaults (change in `engine/engine.py` or `.env`)
 
 | Setting | Default |

@@ -299,7 +299,7 @@ class SignalService:
             if plan["errors"]:
                 sig.status, sig.error = "failed", "; ".join(plan["errors"])
                 return self._save(sig)
-            if ch.mode == "auto":
+            if self._auto(ch):
                 return self._arm(sig, ch)
         sig.status = "pending"
         self._save(sig)
@@ -450,7 +450,7 @@ class SignalService:
                 return self._save(sig)
             plan["tp"] = p.tps[-1]
         sig.plan, sig.ticket = plan, (plan["tickets"] or [None])[0]
-        if ch.mode == "auto":
+        if self._auto(ch):
             return self._apply(sig)
         sig.status = "pending"
         self._save(sig)
@@ -530,6 +530,9 @@ class SignalService:
         """Breakeven armor: the channel says a target was hit, so protect what's open from it."""
         if not self.cfg.be_on_tp_hit:
             return
+        if self.trading.automation_paused:
+            sig.note = "Automatic trading is paused: stop not moved"
+            return
         origin, trades = self._targets(ch, sig.reply_to)
         if origin is None:
             return
@@ -590,6 +593,8 @@ class SignalService:
                     else:
                         sig.note = f"No SL after {self.cfg.wait_for_sl_s:g} s: entering with the default stop"
                         self._handle_open(sig, ch, ParsedSignal(**sig.parsed), waited=True)
+                elif self.trading.automation_paused:
+                    continue                                # waiting entries stand still while paused
                 elif s["status"] in ("armed", "placed") and any(l.get("status") == "waiting"
                                                                 for l in (s.get("plan") or {}).get("legs", [])):
                     sig = _sig(s)
@@ -687,6 +692,10 @@ class SignalService:
         return {"signal": origin.to_dict(), "followups": related, "trades": trades, "events": events}
 
     # -------------------------------------------------------------- helpers
+
+    def _auto(self, ch: Channel) -> bool:
+        """Act without asking: the channel is in auto mode and automatic trading isn't paused."""
+        return ch.mode == "auto" and not self.trading.automation_paused
 
     def _preset(self, ch: Channel):
         from engine import TradeSettings

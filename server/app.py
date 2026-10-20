@@ -53,11 +53,15 @@ class SettingsIn(BaseModel):
                                                          StepIn(pips=100, close_pct=0, move_sl_pips=50)])
     trailing: bool = True
     trail_pips: float = 50.0
+    be_trigger_pips: float | None = None   # breakeven rule: move SL to entry + be_lock_pips at this profit
+    be_lock_pips: float = 1.0
+    hold_seconds: float = 0.0              # steps / breakeven fire only after price holds past the level
 
     def to_settings(self) -> TradeSettings:
         return TradeSettings(lot=self.lot, stop_mode=self.stop_mode, sl_pips=self.sl_pips, tp_pips=self.tp_pips,
                              steps=[StepConfig(s.pips, s.close_pct, s.move_sl_pips) for s in self.steps],
-                             trailing=self.trailing, trail_pips=self.trail_pips)
+                             trailing=self.trailing, trail_pips=self.trail_pips, be_trigger_pips=self.be_trigger_pips,
+                             be_lock_pips=self.be_lock_pips, hold_seconds=self.hold_seconds)
 
 
 class OpenIn(BaseModel):
@@ -169,6 +173,10 @@ class SignalSettingsIn(BaseModel):
 class TestParseIn(BaseModel):
     text: str
     channel_id: int | None = None
+
+
+class AutomationIn(BaseModel):
+    paused: bool
 
 
 class OwnSignalIn(BaseModel):
@@ -296,8 +304,13 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     # -- status
 
     @app.get("/api/status", dependencies=[api])
-    def status(s: TradingService = Depends(svc)):
-        return s.status()
+    def status(request: Request, s: TradingService = Depends(svc)):
+        return {**s.status(), "features": {"markets": request.app.state.market is not None,
+                                           "signals": request.app.state.signals is not None}}
+
+    @app.put("/api/automation", dependencies=[api])
+    def set_automation(body: AutomationIn, s: TradingService = Depends(svc)):
+        return {"paused": s.set_automation_paused(body.paused)}
 
     # -- trades
 

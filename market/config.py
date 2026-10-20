@@ -57,7 +57,7 @@ class MarketConfig:
     news_after_min: float = 180
     news_impacts: list[str] = field(default_factory=lambda: ["high"])
     # The gold feed: the gold idea goes to the signal service as the "Market Watch" channel
-    feed: bool = True
+    feed: bool = False
     feed_timeframe: str = DEFAULT_TIMEFRAME
     feed_min_confidence: float = 40
     feed_min_score: float = 20
@@ -69,7 +69,7 @@ class MarketConfig:
         tfs = [t for t in _list("MW_TIMEFRAMES", ",".join(TIMEFRAMES)) if t in TIMEFRAMES]
         feed_tf = os.environ.get("MW_FEED_TIMEFRAME", DEFAULT_TIMEFRAME)
         return MarketConfig(
-            enabled=_bool("MW_ENABLED", True),
+            enabled=_bool("MW_ENABLED", False),
             refresh_seconds=max(30.0, _num("MW_REFRESH_SECONDS", 120)),
             timeframes=tfs or [DEFAULT_TIMEFRAME],
             twelvedata_key=os.environ.get("TWELVEDATA_API_KEY", ""),
@@ -80,7 +80,7 @@ class MarketConfig:
             news_before_min=_num("NEWS_BLOCK_BEFORE_MIN", 60),
             news_after_min=_num("NEWS_BLOCK_AFTER_MIN", 180),
             news_impacts=_list("NEWS_BLOCK_IMPACTS", "high"),
-            feed=_bool("MW_FEED_ENABLED", True),
+            feed=_bool("MW_FEED_ENABLED", False),
             feed_timeframe=feed_tf if feed_tf in TIMEFRAMES else DEFAULT_TIMEFRAME,
             feed_min_confidence=_num("MW_FEED_MIN_CONFIDENCE", 40),
             feed_min_score=_num("MW_FEED_MIN_SCORE", 20),

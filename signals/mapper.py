@@ -120,7 +120,9 @@ def build_plan(p: ParsedSignal, channel: Channel, preset: TradeSettings, cfg: Si
     if risk_usd is None and sl_pips > 0:
         risk_usd = dollars(sl_pips, lot, info.contract_size)
     settings = TradeSettings(lot=lot, stop_mode=StopMode.FAR, sl_pips=sl_pips, tp_pips=tp_pips,
-                             steps=steps, trailing=preset.trailing, trail_pips=preset.trail_pips)
+                             steps=steps, trailing=preset.trailing, trail_pips=preset.trail_pips,
+                             be_trigger_pips=preset.be_trigger_pips, be_lock_pips=preset.be_lock_pips,
+                             hold_seconds=preset.hold_seconds)
     return {
         "side": side.value, "lot": lot, "ref_price": ref, "sl_price": p.sl, "tps": p.tps,
         "settings": _settings_dict(settings), "errors": errors, "warnings": warnings,
@@ -132,11 +134,14 @@ def build_plan(p: ParsedSignal, channel: Channel, preset: TradeSettings, cfg: Si
 def _settings_dict(s: TradeSettings) -> dict:
     return {"lot": s.lot, "stop_mode": s.stop_mode.value, "sl_pips": s.sl_pips, "tp_pips": s.tp_pips,
             "steps": [{"pips": st.pips, "close_pct": st.close_pct, "move_sl_pips": st.move_sl_pips} for st in s.steps],
-            "trailing": s.trailing, "trail_pips": s.trail_pips}
+            "trailing": s.trailing, "trail_pips": s.trail_pips, "be_trigger_pips": s.be_trigger_pips,
+            "be_lock_pips": s.be_lock_pips, "hold_seconds": s.hold_seconds}
 
 
 def settings_from_dict(d: dict) -> TradeSettings:
     return TradeSettings(lot=d["lot"], stop_mode=StopMode(d["stop_mode"]), sl_pips=d.get("sl_pips"),
                          tp_pips=d.get("tp_pips"),
                          steps=[StepConfig(s["pips"], s.get("close_pct", 0), s.get("move_sl_pips")) for s in d["steps"]],
-                         trailing=d.get("trailing", True), trail_pips=d.get("trail_pips", 50))
+                         trailing=d.get("trailing", True), trail_pips=d.get("trail_pips", 50),
+                         be_trigger_pips=d.get("be_trigger_pips"), be_lock_pips=d.get("be_lock_pips", 1.0),
+                         hold_seconds=d.get("hold_seconds", 0.0))

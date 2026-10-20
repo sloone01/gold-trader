@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import asdict, replace
 
-from engine import Engine, EngineConfig, Event, Preset, RiskLimits, Side, StopMode, Trade, TradeSettings
+from engine import Engine, EngineConfig, Event, Preset, RiskLimits, Side, StepConfig, StopMode, Trade, TradeSettings
 from engine.broker import Broker, Quote
 from engine.store import MemoryStore
 from engine.units import PIP, dollars, price_to_pips
@@ -23,6 +23,10 @@ DEFAULT_PRESETS = [
     ("Default hybrid", TradeSettings()),
     ("Tight scalp", TradeSettings(stop_mode=StopMode.TIGHT, trail_pips=30)),
     ("Far runner", TradeSettings(stop_mode=StopMode.FAR, sl_pips=150, trailing=True, trail_pips=50)),
+    # Takes half at +20 but keeps the stop where it is, so normal gold pullbacks don't knock the rest out
+    # at breakeven; breakeven (+5) only once +40 has held for 15 seconds.
+    ("Hold the runner", TradeSettings(steps=[StepConfig(20, 50, None), StepConfig(60, 25, 20), StepConfig(120, 0, 50)],
+                                      be_trigger_pips=40, be_lock_pips=5, hold_seconds=15)),
 ]
 
 
@@ -85,6 +89,20 @@ class TradingService:
             self.publish(e)
         return events
 
+    # ----------------------------------------------------------- automation
+
+    @property
+    def automation_paused(self) -> bool:
+        """Master switch: while paused nothing opens or changes a trade on its own (auto channels wait
+        for your tap, ladders and the Markets auto-trader stand still). P1-P3, breakeven and trailing on
+        open trades keep running: that's managing your trades, not opening new ones."""
+        return bool((self.store.get_setting("automation") or {}).get("paused"))
+
+    def set_automation_paused(self, paused: bool) -> bool:
+        self.store.put_setting("automation", {"paused": bool(paused)})
+        self.publish(Event("info", 0, "Automatic trading paused" if paused else "Automatic trading resumed", None))
+        return bool(paused)
+
     # --------------------------------------------------------------- events
 
     def publish(self, event: Event | dict) -> dict:
@@ -112,6 +130,7 @@ class TradingService:
         with self.lock:
             quote = self.broker.quote()
             acc = self.broker.account()
+            paused = self.automation_paused
             open_trades = [self.trade_view(t, quote) for t in self.store.open_trades()]
             return {
                 "symbol": getattr(self.broker, "symbol", "XAUUSD"),
@@ -126,6 +145,7 @@ class TradingService:
                                "sl": p.sl, "tp": p.tp} for p in self.engine.unmanaged_positions()],
                 "limits": asdict(self.engine.limits),
                 "info": asdict(self.engine.info),
+                "automation_paused": paused,
                 "engine": {"last_tick": self.last_tick, "last_error": self.last_error,
                            "running": self._thread is not None, "sim": self.sim_walk},
             }
