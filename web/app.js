@@ -563,6 +563,29 @@
     return `${plan.side.toUpperCase()} ${fmt.lot(plan.lot)} lot ${entry} · SL ${plan.sl_price ?? "default"} (${s.sl_pips} pips)${plan.risk_usd != null ? ` · risk ${fmt.usd(-plan.risk_usd)}` : ""} · P ${s.steps.map((x) => "+" + x.pips).join(" / ")}${s.tp_pips ? ` · TP +${s.tp_pips}` : ""}`;
   }
 
+  const AGENT_DESC = {
+    open_trade: (i) => `Open ${i.side.toUpperCase()} ${i.entry != null ? `${i.order_type} @ ${i.entry}${i.entry_high ? "-" + i.entry_high : ""}` : "at market"}, SL ${i.sl ?? "?"}, TP ${(i.tps || []).join(", ") || "?"}`,
+    wait_for_levels: (i) => `Wait for the stop and targets of a ${i.side.toUpperCase()}`,
+    update_levels: (i) => `Set levels on ${(i.targets || []).join(", ")}: SL ${i.sl ?? "-"}, TP ${(i.tps || []).join(", ") || "-"}`,
+    add_entry: (i) => `Add an entry to ${i.to} ${i.entry != null ? "@ " + i.entry : "at market"}`,
+    close: (i) => `${i.percent < 100 ? `Close ${i.percent}% of` : "Close"} ${(i.targets || []).join(", ")}`,
+    move_sl: (i) => `Move SL of ${(i.targets || []).join(", ")} to ${i.breakeven ? "breakeven" : i.price}`,
+    set_tp: (i) => `Set TP of ${(i.targets || []).join(", ")} to ${i.tp}`,
+    cancel_pending: (i) => `Cancel ${(i.targets || []).join(", ")}`,
+    ask_me: (i) => `Asks you: ${i.question}`,
+    no_action: (i) => `No action (${i.kind})`,
+  };
+  function agentHtml(sig) {
+    const a = sig.agent;
+    if (!a) return "";
+    const acts = (a.actions || []).map((x) => `<div>• ${esc((AGENT_DESC[x.tool] || ((i) => x.tool))(x.input))}${x.input.reason ? ` <span class="muted">— ${esc(x.input.reason)}</span>` : ""}</div>`).join("");
+    const refs = a.inputs?.refs ? "" : "";
+    return `<div class="agent-box small"><b>Agent${a.mode === "shadow" ? " (shadow)" : ""}${a.relearned ? " · after your lesson" : ""}:</b>${acts || ""}
+      ${a.error && !acts ? `<div class="error">${esc(a.error)}</div>` : ""}
+      ${(a.notes_saved || []).map((n) => `<div class="muted">Learned (${esc(n.scope)}): ${esc(n.text)}</div>`).join("")}
+      ${a.answered ? `<div class="muted">You answered: ${esc(a.answered.answer)}</div>` : ""}${refs}</div>`;
+  }
+
   function signalCard(sig, digits) {
     const p = sig.parsed || {};
     const pending = sig.status === "pending";
@@ -584,7 +607,9 @@
         ${sig.plan?.settings ? `<input type="number" step="0.01" min="0.01" data-lot="${sig.id}" value="${sig.plan.lot}" style="flex:0 0 90px;margin:0" title="lot">` : ""}
         <button class="primary" data-place="${sig.id}">${sig.plan?.action ? "Apply" : "Place trade"}</button>
         <button class="ghost" data-dismiss="${sig.id}">Dismiss</button></div>` : ""}
-      <div class="row" style="margin-top:6px;gap:14px">${sig.ticket && sig.status !== "pending" ? `<a class="small" href="#/detail/${sig.ticket}">Trade #${sig.ticket} →</a>` : ""}${p.action && p.action !== "ignore" ? `<a class="small" href="#/signal/${sig.id}">Timeline →</a>` : ""}</div>
+      ${agentHtml(sig)}
+      <div class="row" style="margin-top:6px;gap:14px">${sig.ticket && sig.status !== "pending" ? `<a class="small" href="#/detail/${sig.ticket}">Trade #${sig.ticket} →</a>` : ""}${p.action && p.action !== "ignore" ? `<a class="small" href="#/signal/${sig.id}">Timeline →</a>` : ""}${S.agent?.available ? `<a class="small" href="#" data-teach="${sig.id}">Teach the agent</a>` : ""}</div>
+      <div id="teach-${sig.id}"></div>
     </div>`;
   }
 
@@ -595,7 +620,8 @@
         <p class="small muted">Add <code>ANTHROPIC_API_KEY</code>, <code>TG_API_ID</code> and <code>TG_API_HASH</code> to <code>.env</code>, run <code>py -m scripts.telegram_login</code> once on the VPS, then restart the server.</p></div>`;
       return;
     }
-    const [sigs, chans] = await Promise.all([api("/signals?limit=100"), api("/channels")]);
+    const [sigs, chans, agent] = await Promise.all([api("/signals?limit=100"), api("/channels"), api("/agent").catch(() => ({ available: false, questions: [] }))]);
+    S.agent = agent;
     const digits = S.status?.info?.digits ?? 2;
     const tg = st.telegram;
     const pending = sigs.filter((s) => s.status === "pending").reverse();
@@ -607,6 +633,13 @@
       <div class="small ${tg ? (tg.connected ? "pos" : "neg") : "warn"}" style="margin-bottom:10px">
         ${tg ? (tg.connected ? `Telegram connected as ${esc(tg.user || "")} · listening to ${chans.filter((c) => c.mode !== "off").length} channel(s)` : `Telegram not connected${tg.error ? ": " + esc(tg.error) : ""}`) : "Telegram not configured (TG_API_ID / TG_API_HASH)"}
       </div>
+      ${agent.questions.length ? `<h2>The agent asks (${agent.questions.length})</h2>${agent.questions.map((q) => `<div class="card agent-q">
+        <div class="row between"><b>${esc(q.channel_title)}</b><span class="muted small">${fmt.date(q.ts)}</span></div>
+        <div class="small muted" style="white-space:pre-wrap;margin:4px 0">${esc(q.text)}</div>
+        <div><b>${esc(q.question)}</b></div>
+        <textarea rows="2" data-answer-text="${q.signal_id}" placeholder="Your answer — it is saved as a lesson for this channel" class="ta"></textarea>
+        <div class="btns"><button class="primary sm" data-answer="${q.signal_id}">Answer</button></div></div>`).join("")}` : ""}
+      ${agent.available ? `<div class="small muted" style="margin-bottom:8px">Agent: <b>${agent.mode === "shadow" ? "shadow mode (shows what it would do)" : "off"}</b> · <a href="#/channels">settings & knowledge</a></div>` : ""}
       <h2>Waiting for you (${pending.length})</h2>
       ${pending.length ? pending.map((s) => signalCard(s, digits)).join("") : `<div class="card empty small">Nothing to confirm.</div>`}
       ${working.length ? `<h2>Waiting for price or stop (${working.length})</h2>${working.map((s) => signalCard(s, digits)).join("")}` : ""}
@@ -633,6 +666,28 @@
       if (r.status === "failed") throw new Error(r.error || "Failed");
     })));
     view.querySelectorAll("[data-dismiss]").forEach((b) => b.addEventListener("click", act(() => api(`/signals/${b.dataset.dismiss}/dismiss`, { method: "POST" }))));
+    view.querySelectorAll("[data-answer]").forEach((b) => b.addEventListener("click", async () => {
+      const id = b.dataset.answer, text = $(`[data-answer-text="${id}"]`).value.trim();
+      if (!text) return;
+      b.disabled = true; b.textContent = "Re-reading…";
+      try { await api(`/signals/${id}/answer`, { method: "POST", body: { text } }); toast("Thanks — lesson saved"); renderSignals(); } catch (e) { fail(e); b.disabled = false; b.textContent = "Answer"; }
+    }));
+    view.querySelectorAll("[data-teach]").forEach((a) => a.addEventListener("click", (e) => {
+      e.preventDefault();
+      const id = a.dataset.teach, box = $(`#teach-${id}`);
+      if (box.innerHTML) { box.innerHTML = ""; return; }
+      box.innerHTML = `<div class="teach">
+        <textarea rows="3" class="ta" id="teach-text-${id}" placeholder="What did it get wrong, and what does this message really mean? e.g. 'In this channel \"secure\" means close half and move SL to entry'"></textarea>
+        <div class="row" style="margin-top:6px"><select id="teach-scope-${id}" style="margin:0;width:auto"><option value="channel">This channel only</option><option value="shared">All channels</option></select>
+        <button class="primary sm" id="teach-go-${id}">Teach & re-read</button></div></div>`;
+      $(`#teach-go-${id}`).addEventListener("click", async (ev) => {
+        const text = $(`#teach-text-${id}`).value.trim();
+        if (!text) return;
+        ev.target.disabled = true; ev.target.textContent = "Re-reading…";
+        try { await api(`/signals/${id}/teach`, { method: "POST", body: { text, scope: $(`#teach-scope-${id}`).value } }); toast("Lesson saved"); renderSignals(); }
+        catch (err) { fail(err); ev.target.disabled = false; ev.target.textContent = "Teach & re-read"; }
+      });
+    }));
     $("#sig-own-btn").addEventListener("click", async () => {
       const text = $("#sig-own").value.trim();
       if (!text) return;
@@ -661,6 +716,11 @@
       } catch (e) { out.innerHTML = ""; fail(e); }
     });
   }
+
+  setInterval(() => {
+    const busy = document.activeElement && ["TEXTAREA", "INPUT", "SELECT"].includes(document.activeElement.tagName);
+    if (S.route === "signals" && document.visibilityState === "visible" && !busy && !document.querySelector(".teach")) renderSignals().catch(() => {});
+  }, 15000);
 
   // --------------------------------------------------------------- timeline
   async function renderTimeline() {
@@ -697,7 +757,8 @@
   }
 
   async function renderChannels() {
-    const [chans, cfg, avail] = await Promise.all([api("/channels"), api("/signals/settings"), api("/channels/available").catch(() => ({ connected: false, dialogs: [] }))]);
+    const [chans, cfg, avail, agent] = await Promise.all([api("/channels"), api("/signals/settings"), api("/channels/available").catch(() => ({ connected: false, dialogs: [] })), api("/agent").catch(() => ({ available: false, knowledge: { shared: [], channels: {} } }))]);
+    const noteList = (notes) => (notes || []).map((n) => `<div class="note"><span>${esc(n.text)}${n.source === "you" ? ` <span class="pill">you</span>` : ` <span class="pill">agent</span>`}${n.example ? `<div class="muted">e.g. “${esc(n.example)}”</div>` : ""}</span><span class="row"><a href="#" data-note-edit="${n.id}" data-note-text="${esc(n.text)}">edit</a><a href="#" data-note-del="${n.id}">delete</a></span></div>`).join("") || `<div class="muted small">Nothing yet.</div>`;
     if (!S.presets.length) S.presets = await api("/presets").catch(() => []);
     const known = new Set(chans.map((c) => c.id));
     const addable = (avail.dialogs || []).filter((d) => !known.has(d.id));
@@ -736,10 +797,16 @@
           <label>Cancel unfilled after (min)<input type="number" step="30" min="5" id="c-expiry" value="${cfg.ladder_expiry_min}"></label>
         </div>
         <div class="small muted">Buy/sell limit and stop orders always wait for their price, ladder or not.</div>
+        <h3 style="margin-top:16px">Signal agent</h3>
+        ${agent.available ? `<label>Agent<select id="c-agent"><option value="off" ${cfg.agent_mode !== "shadow" ? "selected" : ""}>Off</option><option value="shadow" ${cfg.agent_mode === "shadow" ? "selected" : ""}>Shadow: read every message and show what it would do (no trading)</option></select></label>
+          <div class="small muted">Uses ${esc(agent.model || "Claude")} on every channel message (roughly 1–3 cents each).</div>` : `<div class="small warn">Needs ANTHROPIC_API_KEY on the server.</div>`}
         <h3 style="margin-top:16px">Breakeven armor</h3>
         <div class="inline"><input type="checkbox" id="c-armor" ${cfg.be_on_tp_hit ? "checked" : ""}><label for="c-armor" style="margin:0;color:var(--text)">When the channel posts "TP1 hit", move its trades' stop to breakeven</label></div>
         <button class="wide primary" id="c-save">Save rules</button>
       </div>
+      ${agent.available ? `<h2>Agent knowledge · all channels</h2>
+      <div class="card small">${noteList(agent.knowledge.shared)}
+        <div class="row" style="margin-top:8px"><input id="note-shared" placeholder="Add a lesson for every channel" style="margin:0"><button class="sm" data-note-add="shared">Add</button></div></div>` : ""}
       <h2>Followed channels (${chans.length})</h2>
       ${chans.length ? chans.map((c) => `<div class="card">
         <div class="row between"><h3>${esc(c.title)}</h3><span class="muted small">${c.id}</span></div>
@@ -751,6 +818,9 @@
         <div class="small" style="margin-top:6px" id="topic-${c.id}">${c.feed ? `Feed · signals pushed by another app over the API` : (c.topics || []).length ? `Topics: <b>${c.topics.map((t) => esc(t.title || t.id)).join(", ")}</b> · <a href="#" data-topics="${c.id}">change</a>` : `Whole group · <a href="#" data-topics="${c.id}">pick topics</a>`}</div>
         <div class="btns"><button class="primary sm" data-save="${c.id}" data-title="${esc(c.title)}">Save</button><button class="danger sm" data-del="${c.id}">Remove</button></div>
         ${reviewHtml(c.review)}
+        ${agent.available ? `<details class="small" style="margin-top:8px"><summary>Agent knowledge for this channel (${(agent.knowledge.channels[c.id] || []).length})</summary>
+          ${noteList(agent.knowledge.channels[c.id])}
+          <div class="row" style="margin-top:8px"><input id="note-${c.id}" placeholder="Add a lesson for ${esc(c.title)}" style="margin:0"><button class="sm" data-note-add="${c.id}">Add</button></div></details>` : ""}
       </div>`).join("") : `<div class="card empty small">No channels followed yet.</div>`}
       <h2>Add a channel</h2>
       <div class="card">
@@ -770,10 +840,27 @@
           sizing: $("#c-sizing").value, risk_pct_per_weight: Number($("#c-riskpct").value),
           wait_for_sl_s: Number($("#c-wait").value), no_sl_action: $("#c-nosl").value,
           ladder: $("#c-ladder").checked, ladder_legs: Number($("#c-legs").value), ladder_depth_pct: Number($("#c-depth").value),
-          ladder_expiry_min: Number($("#c-expiry").value), be_on_tp_hit: $("#c-armor").checked } });
+          ladder_expiry_min: Number($("#c-expiry").value), be_on_tp_hit: $("#c-armor").checked,
+          agent_mode: $("#c-agent")?.value || cfg.agent_mode || "off" } });
         reload("Rules saved");
       } catch (e) { fail(e); }
     });
+    view.querySelectorAll("[data-note-add]").forEach((b) => b.addEventListener("click", async () => {
+      const k = b.dataset.noteAdd, input = $(k === "shared" ? "#note-shared" : `#note-${k}`), text = input.value.trim();
+      if (!text) return;
+      try { await api("/agent/notes", { method: "POST", body: k === "shared" ? { text, scope: "shared" } : { text, scope: "channel", channel_id: Number(k) } }); reload("Lesson added"); } catch (e) { fail(e); }
+    }));
+    view.querySelectorAll("[data-note-del]").forEach((a) => a.addEventListener("click", async (e) => {
+      e.preventDefault();
+      if (!confirm("Delete this lesson?")) return;
+      try { await api(`/agent/notes/${a.dataset.noteDel}`, { method: "DELETE" }); reload("Deleted"); } catch (err) { fail(err); }
+    }));
+    view.querySelectorAll("[data-note-edit]").forEach((a) => a.addEventListener("click", async (e) => {
+      e.preventDefault();
+      const text = prompt("Edit lesson", a.dataset.noteText);
+      if (!text) return;
+      try { await api(`/agent/notes/${a.dataset.noteEdit}`, { method: "PATCH", body: { text } }); reload("Saved"); } catch (err) { fail(err); }
+    }));
     const ticked = (root) => [...root.querySelectorAll("input[type=checkbox][data-tid]:checked")].map((i) => ({ id: Number(i.dataset.tid), title: i.dataset.ttitle }));
     const topicBoxes = (topics, selected) => topics.map((t) => `<label class="inline" style="margin-top:6px"><input type="checkbox" data-tid="${t.id}" data-ttitle="${esc(t.title)}" ${selected.has(t.id) ? "checked" : ""}>${esc(t.title)}</label>`).join("");
     const topicOf = (id) => {

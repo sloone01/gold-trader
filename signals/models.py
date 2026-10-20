@@ -73,6 +73,8 @@ class SignalSettings:
     ladder_expiry_min: float = 240.0    # unfilled entries are cancelled after this
     # Breakeven armor: when the channel posts "TP1 hit", move the stop of its trades to breakeven.
     be_on_tp_hit: bool = True
+    # The signal agent: off | shadow (reads every message and shows what it would do; nothing trades differently)
+    agent_mode: str = "off"
 
     def to_dict(self) -> dict:
         return asdict(self)

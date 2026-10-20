@@ -97,6 +97,16 @@ The **Markets** tab is the former Market Watch app, now part of Gold Trader: gol
 
 **Moving over from the old `trading` app:** copy your keys and `AUTO_TRADE_*` / `SWEEP_BOS_*` / `MT5_SYMBOL_*` lines into this `.env`. `AUTO_TRADE_MODE=bridge` now means `mt5`, and the separate MT5 bridge, `GOLD_TRADER_*` settings and Node server are no longer needed. `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` still work for flip alerts. The old backtest scripts (`scripts/backtest*.js`) were not ported.
 
+### The signal agent (shadow mode)
+
+One Claude agent (Claude Opus 5.5) reads every channel message the way a person would: with the channel's open trades (T1, T2…) and waiting signals (W1…), its recent conversation, and what it has learned. It answers with decisions: open, wait for the levels, add an entry, close the old one and keep the new one, move the stop, set a TP, cancel, ask you, or nothing.
+
+- **Shadow mode** (Signals → Channels → Rules → Signal agent): every message shows the agent's reading next to what was actually done. Nothing trades differently yet; this is for checking it before it's trusted with real decisions.
+- **It learns in two places:** shared knowledge (true for every channel) and per-channel notes (one channel's habits). It saves its own notes; yours are marked "you" and override its habits. All of them are listed, editable and deletable on the Channels screen.
+- **Teach it** on any signal (ignored or not): say what it misread and whether the lesson is for this channel or all channels. The lesson is saved with the message as an example, and the agent re-reads the message at once so you see if it now gets it.
+- **It asks you** when a message is too unclear: the question appears at the top of Signals (and as a notification); your answer becomes a lesson and it re-reads the message.
+- Needs `ANTHROPIC_API_KEY`; roughly 1–3 cents per message. `GT_AGENT_MODEL` changes the model.
+
 ### Feeds: signals from another app
 
 Another program can push structured signals instead of Telegram messages, and each sender is handled as a channel: it shows up in **Signals → Channels** with its own trust weight, mode, preset and scorecard, and its trades get the same P1–P3, trailing and risk limits. Market Watch (the `trading` repo) uses this for its gold ideas.

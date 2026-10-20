@@ -125,9 +125,11 @@ def build_signals(trading: TradingService):
     if not os.environ.get("ANTHROPIC_API_KEY"):
         log.warning("ANTHROPIC_API_KEY not set: Telegram signals disabled (feeds still work)")
         return SignalService(trading, None)
+    from signals.agent import Knowledge, SignalAgent
     from signals.parser import ClaudeParser
     saved = trading.store.get_setting("signals") or {}
     sigs = SignalService(trading, ClaudeParser(model=saved.get("model", "claude-opus-5")))
+    sigs.agent = SignalAgent(Knowledge(trading.store), model=os.environ.get("GT_AGENT_MODEL", "claude-opus-5-5"))
     api_id, api_hash = os.environ.get("TG_API_ID"), os.environ.get("TG_API_HASH")
     if api_id and api_hash:
         from signals.telegram import TelegramListener
@@ -168,10 +170,22 @@ class SignalSettingsIn(BaseModel):
     ladder_depth_pct: float = 50.0
     ladder_expiry_min: float = 240.0
     be_on_tp_hit: bool = True
+    agent_mode: str = "off"
 
 
 class TestParseIn(BaseModel):
     text: str
+    channel_id: int | None = None
+
+
+class TeachIn(BaseModel):
+    text: str = Field(min_length=1, max_length=600)
+    scope: str = "channel"          # channel | shared
+
+
+class NoteIn(BaseModel):
+    text: str = Field(min_length=1, max_length=600)
+    scope: str = "channel"
     channel_id: int | None = None
 
 
@@ -456,6 +470,55 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
         if sig is None:
             raise HTTPException(400, "The My signals channel is off")
         return sig.to_dict()
+
+    # -- the signal agent (shadow mode): knowledge, lessons, questions
+
+    def agent_of(s):
+        if s.agent is None:
+            raise HTTPException(503, "The agent needs ANTHROPIC_API_KEY")
+        return s.agent
+
+    @app.get("/api/agent", dependencies=[api])
+    def agent_info(request: Request):
+        s = request.app.state.signals
+        if s is None or s.agent is None:
+            return {"available": False, "mode": "off", "knowledge": {"shared": [], "channels": {}}, "questions": []}
+        return {"available": True, "mode": s.cfg.agent_mode, "model": s.agent.model,
+                "knowledge": s.agent.knowledge.all(), "questions": s.agent_questions()}
+
+    @app.post("/api/agent/notes", dependencies=[api], status_code=201)
+    def add_note(body: NoteIn, s=Depends(sigs)):
+        try:
+            return agent_of(s).knowledge.add(body.scope, body.channel_id, body.text, "you")
+        except ValueError as ex:
+            raise HTTPException(400, str(ex))
+
+    @app.patch("/api/agent/notes/{note_id}", dependencies=[api])
+    def edit_note(note_id: int, body: NoteIn, s=Depends(sigs)):
+        if not agent_of(s).knowledge.update(note_id, body.text):
+            raise HTTPException(404, "Note not found")
+        return {"ok": True}
+
+    @app.delete("/api/agent/notes/{note_id}", dependencies=[api])
+    def delete_note(note_id: int, s=Depends(sigs)):
+        if not agent_of(s).knowledge.update(note_id, delete=True):
+            raise HTTPException(404, "Note not found")
+        return {"ok": True}
+
+    @app.post("/api/signals/{signal_id}/teach", dependencies=[api])
+    def teach_signal(signal_id: int, body: TeachIn, s=Depends(sigs)):
+        agent_of(s)
+        try:
+            r = s.teach(signal_id, body.text, body.scope)
+        except ValueError as ex:
+            raise HTTPException(400, str(ex))
+        return {k: v for k, v in (r or {}).items() if k != "inputs"}
+
+    @app.post("/api/signals/{signal_id}/answer", dependencies=[api])
+    def answer_signal(signal_id: int, body: TeachIn, s=Depends(sigs)):
+        agent_of(s)
+        r = s.answer(signal_id, body.text)
+        return {k: v for k, v in (r or {}).items() if k != "inputs"}
 
     @app.get("/api/signals/{signal_id}/timeline", dependencies=[api])
     def signal_timeline(signal_id: int, s=Depends(sigs)):

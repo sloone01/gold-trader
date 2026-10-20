@@ -33,6 +33,8 @@ class SignalService:
         saved = self.store.get_setting("signals") or {}
         self.cfg = SignalSettings(**{k: v for k, v in saved.items() if k in SignalSettings.__dataclass_fields__})
         self.telegram = None            # set by the server when Telegram is configured
+        self.agent = None               # signals.agent.SignalAgent, set by the server when ANTHROPIC_API_KEY is set
+        self.agent_async = True         # run the agent in a background thread (tests run it inline)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -89,6 +91,8 @@ class SignalService:
             raise ValueError("sizing must be weight or risk")
         if cfg.no_sl_action not in ("default", "skip"):
             raise ValueError("no_sl_action must be default or skip")
+        if cfg.agent_mode not in ("off", "shadow"):
+            raise ValueError("agent_mode must be off or shadow")
         self.cfg = cfg
         self.store.put_setting("signals", cfg.to_dict())
         return cfg
@@ -159,7 +163,11 @@ class SignalService:
             sig.status, sig.error = "failed", f"Parse failed: {ex}"
             return self._save(sig)
         with self.lock:
-            return self._route(sig, ch, parsed)
+            snapshot = self._agent_inputs(ch, reply_to) if self._agent_on() else None
+            sig = self._route(sig, ch, parsed)
+        if snapshot is not None:
+            self._run_agent(sig.id, ch, text or "", snapshot, image, image_type)
+        return sig
 
     def own_signal(self, text: str) -> Signal | None:
         """A signal you type in the app: handled as the "My signals" channel (created in confirm mode)."""
@@ -671,7 +679,13 @@ class SignalService:
         return out
 
     def signals(self, limit: int = 100) -> list[dict]:
-        return self.store.recent_signals(limit)
+        rows = self.store.recent_signals(limit)
+        if self.agent is not None:
+            for s in rows:
+                r = self.agent_result(s["id"])
+                if r:
+                    s["agent"] = {k: v for k, v in r.items() if k != "inputs"}
+        return rows
 
     def timeline(self, signal_id: int) -> dict:
         """One signal's whole conversation: the message, what was read, every entry, the follow-ups and
@@ -690,6 +704,111 @@ class SignalService:
             trades = [self.trading.trade_view(self.store.trades[t], q) for t in sorted(tickets) if t in self.store.trades]
         events = [e for e in self.store.recent_events(1000) if e.get("ticket") in tickets]
         return {"signal": origin.to_dict(), "followups": related, "trades": trades, "events": events}
+
+    # ------------------------------------------------------------------ agent
+
+    def _agent_on(self) -> bool:
+        return self.agent is not None and self.cfg.agent_mode != "off"
+
+    def _agent_inputs(self, ch: Channel, reply_to: int | None) -> dict:
+        """What the agent sees, taken before this message changes anything: the channel's open trades (T1..),
+        its waiting signals (W1..), the recent conversation and the replied-to message."""
+        q = self.trading.broker.quote()
+        recent = self.store.recent_signals(300, ch.id)
+        trades, waiting, refs = [], [], {}
+        for s in recent:
+            for t in self._open_trades_of(s):
+                trades.append((t, s))
+        trades.sort(key=lambda x: x[0].opened_at)
+        tv = []
+        for n, (t, s) in enumerate(trades, 1):
+            pos = self.trading.broker.position(t.ticket)
+            price = (q.bid if t.side is Side.BUY else q.ask) if q else None
+            tv.append({"ref": f"T{n}", "side": t.side.value, "volume": pos.volume if pos else t.volume,
+                       "opened_volume": t.volume, "entry": t.entry, "sl": t.sl, "tp": t.tp,
+                       "opened": time.strftime("%H:%M", time.localtime(t.opened_at)),
+                       "profit_pips": round((price - t.entry) * t.side.sign / PIP, 1) if price else None,
+                       "steps_hit": sum(1 for st in t.steps if st.status.value == "hit")})
+            refs[f"T{n}"] = {"ticket": t.ticket, "signal_id": s["id"]}
+        n = 0
+        for s in recent:
+            legs = (s.get("plan") or {}).get("legs") or []
+            if s["status"] in ("waiting_sl", "pending", "armed") or any(l.get("status") == "waiting" for l in legs):
+                if (s.get("parsed") or {}).get("action") != "open":
+                    continue
+                n += 1
+                p = s.get("parsed") or {}
+                waiting.append({"ref": f"W{n}", "what": f"{s['status']}: {(p.get('side') or '').upper()} from "
+                                f"\"{s['text'][:120]}\" (SL {p.get('sl')}, TP {p.get('tps')})"})
+                refs[f"W{n}"] = {"signal_id": s["id"]}
+        convo = [{"time": time.strftime("%H:%M", time.localtime(s["ts"])), "text": s["text"][:240],
+                  "done": f"{s['status']}" + (f": {s['note']}" if s.get("note") else "") + (f" ({s['error'][:80]})" if s.get("error") else "")}
+                 for s in recent[-20:]]
+        reply_text = next((s["text"][:300] for s in reversed(recent) if reply_to and s["msg_id"] == reply_to), None)
+        return {"state": {"price": q.bid if q else None, "trades": tv, "waiting": waiting},
+                "recent": convo, "reply_text": reply_text, "refs": refs}
+
+    def _run_agent(self, signal_id: int, ch: Channel, text: str, snapshot: dict, image=None,
+                   image_type: str = "image/jpeg", lesson: bool = False) -> None:
+        def work():
+            res = self.agent.decide(ch.id, ch.title, text, snapshot["state"], snapshot["recent"],
+                                    snapshot.get("reply_text"), image, image_type)
+            res.update(inputs=snapshot, text=text, at=time.time(), mode=self.cfg.agent_mode, relearned=lesson,
+                       channel_id=ch.id, channel_title=ch.title)
+            q = next((a["input"]["question"] for a in res["actions"] if a["tool"] == "ask_me"), None)
+            res["question"] = {"text": q, "answer": None} if q else None
+            self.store.put_setting(f"agent:{signal_id}", res)
+            if q:
+                self.trading.publish(Event("signal", 0, f"Agent asks about {ch.title}: {q}", "Signals"))
+        if self.agent_async:
+            threading.Thread(target=work, name="agent", daemon=True).start()
+        else:
+            work()
+
+    def agent_result(self, signal_id: int) -> dict | None:
+        return self.store.get_setting(f"agent:{signal_id}")
+
+    def _rerun(self, sig: Signal, lesson: bool = True) -> dict | None:
+        prev = self.agent_result(sig.id) or {}
+        ch = self.channel(sig.channel_id) or Channel(sig.channel_id, sig.channel_title)
+        snapshot = prev.get("inputs") or self._agent_inputs(ch, sig.reply_to)
+        self._run_agent(sig.id, ch, prev.get("text") or sig.text, snapshot, lesson=lesson)
+        return self.agent_result(sig.id)
+
+    def teach(self, signal_id: int, text: str, scope: str = "channel") -> dict | None:
+        """Your lesson about a message: saved to the agent's knowledge, then the message is read again with it."""
+        if self.agent is None:
+            raise TradeError("The agent needs ANTHROPIC_API_KEY")
+        sig = self._get(signal_id)
+        self.agent.knowledge.add("shared" if scope == "shared" else "channel", sig.channel_id, text, "you",
+                                 signal_id, example=sig.text)
+        return self._rerun(sig)
+
+    def answer(self, signal_id: int, text: str) -> dict | None:
+        """Your answer to the agent's question: becomes a lesson for that channel, then the message is re-read."""
+        if self.agent is None:
+            raise TradeError("The agent needs ANTHROPIC_API_KEY")
+        sig = self._get(signal_id)
+        res = self.agent_result(signal_id) or {}
+        q = (res.get("question") or {}).get("text")
+        if not q:
+            raise TradeError("The agent has no open question on this signal")
+        self.agent.knowledge.add("channel", sig.channel_id, f"Q: {q} A: {text}", "you", signal_id, example=sig.text)
+        new = self._rerun(sig) or {}
+        new["answered"] = {"question": q, "answer": text}
+        if (new.get("question") or {}).get("text") == q:       # asked the same again: don't loop
+            new["question"] = None
+        self.store.put_setting(f"agent:{signal_id}", new)
+        return new
+
+    def agent_questions(self) -> list[dict]:
+        out = []
+        for s in self.store.recent_signals(300):
+            r = self.agent_result(s["id"])
+            if r and r.get("question") and not r["question"].get("answer"):
+                out.append({"signal_id": s["id"], "channel_title": s["channel_title"], "text": s["text"][:300],
+                            "question": r["question"]["text"], "ts": s["ts"]})
+        return list(reversed(out))
 
     # -------------------------------------------------------------- helpers
 
