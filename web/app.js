@@ -7,6 +7,7 @@
     token: localStorage.getItem("gt_token") || "",
     status: null, presets: [], history: [], events: [],
     route: "home", param: null, timer: null, sse: null,
+    nav: 0,              // bumped on every navigation; a page whose data arrives after you left drops it
     form: null,          // new-trade form state
     detailEdit: {},      // edits in progress on the trade detail page
   };
@@ -15,11 +16,20 @@
 
   async function api(path, opts = {}) {
     const headers = { Authorization: "Bearer " + S.token, ...(opts.body ? { "Content-Type": "application/json" } : {}) };
+    const write = opts.method && opts.method !== "GET";
+    const { timeout = write ? 60000 : 20000, ...init } = opts;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeout);
     let r;
     try {
-      r = await fetch("/api" + path, { ...opts, headers, body: opts.body ? JSON.stringify(opts.body) : undefined });
+      r = await fetch("/api" + path, { ...init, headers, signal: ctl.signal, body: opts.body ? JSON.stringify(opts.body) : undefined });
     } catch (e) {
+      if (e.name === "AbortError") {
+        throw new Error(write ? "The bot didn't answer in time. Check Home before trying again." : "The bot is taking too long to answer.");
+      }
       throw new Error("Can't reach the bot. Is the server running?");
+    } finally {
+      clearTimeout(timer);
     }
     if (r.status === 401) { showLogin(S.token ? "Token rejected" : ""); throw new Error("Not authorised"); }
     const data = r.status === 204 ? null : await r.json().catch(() => null);
@@ -107,7 +117,7 @@
         if (navigator.vibrate && (kind === "closed" || kind === "error" || kind === "signal")) navigator.vibrate(200);
         notify(ev);
         refreshStatus();
-        if (kind === "signal" && (S.route === "signals" || S.route === "channels")) render();
+        if (kind === "signal" && S.route === "signals") render();
       });
     }
     es.onerror = () => setConn(false);
@@ -128,28 +138,37 @@
     const tab = { detail: "home", channels: "signals", presets: "settings", asset: "markets", signal: "signals" }[S.route] || S.route;
     document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("on", a.dataset.tab === tab));
     S.detailEdit = {};
+    S.nav++;
+    if (S.route !== "home") view.innerHTML = `<div class="empty">Loading…</div>`;
     render();
   }
   window.addEventListener("hashchange", navigate);
 
   async function render() {
     if (S.route !== "markets" && S.route !== "asset") view.dir = "ltr";
+    const seq = S.nav;
     try {
       switch (S.route) {
         case "markets": return await renderMarkets();
         case "signal": return await renderTimeline();
         case "asset": return await renderAsset();
         case "home": return renderHome();
-        case "trade": return renderTradeForm();
-        case "detail": return renderDetail();
-        case "history": return renderHistory();
-        case "presets": return renderPresets();
-        case "signals": return renderSignals();
-        case "channels": return renderChannels();
-        case "settings": return renderSettings();
+        case "trade": return await renderTradeForm();
+        case "detail": return await renderDetail();
+        case "history": return await renderHistory();
+        case "presets": return await renderPresets();
+        case "signals": return await renderSignals();
+        case "channels": return await renderChannels();
+        case "settings": return await renderSettings();
         default: location.hash = "#/";
       }
-    } catch (e) { fail(e); }
+    } catch (e) {
+      if (seq !== S.nav) return;
+      if (view.querySelector(".empty") || !view.innerHTML) {
+        view.innerHTML = `<div class="empty">Couldn't load this page.<br><span class="small">${esc(e.message)}</span><br><button class="sm" id="retry-page" style="margin-top:10px">Try again</button></div>`;
+        $("#retry-page").addEventListener("click", () => { view.innerHTML = `<div class="empty">Loading…</div>`; render(); });
+      } else fail(e);
+    }
   }
 
   // ------------------------------------------------------------------- home
@@ -178,7 +197,7 @@
 
   function renderHome() {
     const st = S.status;
-    if (!st) { if (!view.innerHTML) view.innerHTML = `<div class="empty">Connecting…</div>`; return; }
+    if (!st) { view.innerHTML = `<div class="empty">Connecting…</div>`; return; }
     const a = st.account;
     const open = st.open_trades;
     view.innerHTML = `
@@ -289,7 +308,9 @@
   }
 
   async function renderTradeForm() {
+    const seq = S.nav;
     if (!S.presets.length) S.presets = await api("/presets").catch(() => []);
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     if (!S.form) S.form = defaultForm();
     const f = S.form;
     view.innerHTML = `
@@ -358,9 +379,10 @@
 
   // ------------------------------------------------------------ trade detail
   async function renderDetail() {
-    const ticket = Number(S.param);
+    const ticket = Number(S.param), seq = S.nav;
     let t;
-    try { t = await api("/trades/" + ticket); } catch (e) { view.innerHTML = `<a class="back" href="#/">← Back</a><div class="empty">${esc(e.message)}</div>`; return; }
+    try { t = await api("/trades/" + ticket); } catch (e) { if (seq !== S.nav) return; view.innerHTML = `<a class="back" href="#/">← Back</a><div class="empty">${esc(e.message)}</div>`; return; }
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     const d = t.digits;
     const edit = S.detailEdit;   // keep what the user is typing across live refreshes
     const stepRows = t.settings.steps.map((s, i) => {
@@ -493,7 +515,9 @@
 
   // ---------------------------------------------------------------- history
   async function renderHistory() {
+    const seq = S.nav;
     const rows = await api("/history?limit=200");
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     const d = S.status?.info?.digits ?? 2;
     const total = rows.reduce((a, t) => a + (t.result_usd || 0), 0);
     const wins = rows.filter((t) => (t.result_usd || 0) > 0).length;
@@ -515,7 +539,9 @@
 
   // ---------------------------------------------------------------- presets
   async function renderPresets() {
+    const seq = S.nav;
     S.presets = await api("/presets");
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     const editing = S.param ? S.presets.find((p) => p.id === Number(S.param)) : null;
     if (S.param === "new" || editing) {
       const p = editing || { name: "", settings: defaultForm().settings };
@@ -614,13 +640,16 @@
   }
 
   async function renderSignals() {
+    const seq = S.nav;
     const st = await api("/signals/status");
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     if (!st.enabled) {
       view.innerHTML = `<h1>Signals</h1><div class="card"><p>Telegram signals are not enabled on the server.</p>
         <p class="small muted">Add <code>ANTHROPIC_API_KEY</code>, <code>TG_API_ID</code> and <code>TG_API_HASH</code> to <code>.env</code>, run <code>py -m scripts.telegram_login</code> once on the VPS, then restart the server.</p></div>`;
       return;
     }
     const [sigs, chans, agent] = await Promise.all([api("/signals?limit=100"), api("/channels"), api("/agent").catch(() => ({ available: false, questions: [] }))]);
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     S.agent = agent;
     const digits = S.status?.info?.digits ?? 2;
     const tg = st.telegram;
@@ -757,11 +786,14 @@
   }
 
   async function renderChannels() {
-    const [chans, cfg, avail, agent] = await Promise.all([api("/channels"), api("/signals/settings"), api("/channels/available").catch(() => ({ connected: false, dialogs: [] })), api("/agent").catch(() => ({ available: false, knowledge: { shared: [], channels: {} } }))]);
+    // Your Telegram chat list can be slow, so the page draws without it and fills the "Add" card when it arrives.
+    const seq = S.nav;
+    const [chans, cfg, agent] = await Promise.all([api("/channels"), api("/signals/settings"),
+      api("/agent").catch(() => ({ available: false, knowledge: { shared: [], channels: {} } })),
+      S.presets.length ? null : api("/presets").then((p) => { S.presets = p; }).catch(() => {})]);
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     const noteList = (notes) => (notes || []).map((n) => `<div class="note"><span>${esc(n.text)}${n.source === "you" ? ` <span class="pill">you</span>` : ` <span class="pill">agent</span>`}${n.example ? `<div class="muted">e.g. “${esc(n.example)}”</div>` : ""}</span><span class="row"><a href="#" data-note-edit="${n.id}" data-note-text="${esc(n.text)}">edit</a><a href="#" data-note-del="${n.id}">delete</a></span></div>`).join("") || `<div class="muted small">Nothing yet.</div>`;
-    if (!S.presets.length) S.presets = await api("/presets").catch(() => []);
     const known = new Set(chans.map((c) => c.id));
-    const addable = (avail.dialogs || []).filter((d) => !known.has(d.id));
     const weightSel = (v, id) => `<select data-w="${id}" style="margin:0">${[1, 2, 3, 4, 5].map((w) => `<option value="${w}" ${w === v ? "selected" : ""}>${"★".repeat(w)}${"☆".repeat(5 - w)} ${w}</option>`).join("")}</select>`;
     const modeSel = (v, id) => `<select data-m="${id}" style="margin:0">${["off", "confirm", "auto"].map((m) => `<option value="${m}" ${m === v ? "selected" : ""}>${m}</option>`).join("")}</select>`;
     const presetSel = (v, id) => `<select data-p="${id}" style="margin:0"><option value="">Default preset</option>${S.presets.map((p) => `<option value="${p.id}" ${p.id === v ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>`;
@@ -824,8 +856,7 @@
       </div>`).join("") : `<div class="card empty small">No channels followed yet.</div>`}
       <h2>Add a channel</h2>
       <div class="card">
-        ${avail.connected ? (addable.length ? `<label>From your Telegram<select id="add-sel"><option value="">Choose…</option>${addable.map((d) => `<option value="${d.id}" data-title="${esc(d.title)}" data-forum="${d.forum ? 1 : 0}">${esc(d.title)} (${d.forum ? "group with topics" : d.kind})</option>`).join("")}</select></label>` : `<div class="small muted">All your channels and groups are already followed.</div>`)
-          : `<div class="small warn">Telegram is not connected, so the list can't be loaded. You can still add a channel by id (shown by <code>py -m scripts.telegram_login</code>).</div>`}
+        <div id="add-avail"><div class="small muted">Loading your Telegram channels…</div></div>
         <div class="grid2"><label>Channel id<input id="add-id" placeholder="-1001234567890"></label><label>Name<input id="add-title" placeholder="Gold VIP"></label></div>
         <div id="add-topic-wrap" class="hidden"><label>Topics (sub-groups): tick the ones to follow, none = whole group</label><div id="add-topics" class="small"></div></div>
         <div class="grid2"><label>Trust<select id="add-w">${[1, 2, 3, 4, 5].map((w) => `<option value="${w}" ${w === 3 ? "selected" : ""}>${w}</option>`).join("")}</select></label><label>Mode<select id="add-m"><option value="confirm">confirm</option><option value="auto">auto</option><option value="off">off</option></select></label></div>
@@ -892,19 +923,42 @@
       if (!confirm("Stop following this channel?")) return;
       try { await api(`/channels/${b.dataset.del}`, { method: "DELETE" }); reload("Removed"); } catch (e) { fail(e); }
     }));
-    $("#add-sel")?.addEventListener("change", async (e) => {
+    const onPick = async (e) => {
       const o = e.target.selectedOptions[0];
       $("#add-id").value = o.value; $("#add-title").value = o.dataset.title || "";
       const wrap = $("#add-topic-wrap"), list = $("#add-topics");
       list.innerHTML = "";
       wrap.classList.add("hidden");
       if (o.dataset.forum === "1") {
+        list.innerHTML = `<span class="muted">Loading topics…</span>`;
+        wrap.classList.remove("hidden");
         try {
           const topics = await api(`/channels/${o.value}/topics`);
-          if (topics.length) { list.innerHTML = topicBoxes(topics, new Set()); wrap.classList.remove("hidden"); }
-        } catch (err) { fail(err); }
+          if (topics.length) list.innerHTML = topicBoxes(topics, new Set()); else { list.innerHTML = ""; wrap.classList.add("hidden"); }
+        } catch (err) { list.innerHTML = ""; wrap.classList.add("hidden"); fail(err); }
       }
-    });
+    };
+    const loadAvailable = async (refresh = false) => {
+      const box = $("#add-avail");
+      if (!box) return;
+      if (box.querySelector("a")) box.innerHTML = `<div class="small muted">${refresh ? "Refreshing" : "Loading"} your Telegram channels…</div>`;
+      let avail;
+      try { avail = await api("/channels/available" + (refresh ? "?refresh=1" : ""), { timeout: 30000 }); }
+      catch (e) { avail = { connected: true, dialogs: [], error: e.message }; }
+      if (seq !== S.nav || !document.body.contains(box)) return;
+      const addable = (avail.dialogs || []).filter((d) => !known.has(d.id));
+      const again = `<a href="#" id="add-refresh">${avail.error ? "Try again" : "Refresh list"}</a>`;
+      box.innerHTML = !avail.connected
+        ? `<div class="small warn">Telegram is not connected${avail.error ? ` (${esc(avail.error)})` : ""}, so the list can't be loaded. You can still add a channel by id (shown by <code>py -m scripts.telegram_login</code>).</div>`
+        : `${addable.length ? `<label>From your Telegram<select id="add-sel"><option value="">Choose…</option>${addable.map((d) => `<option value="${d.id}" data-title="${esc(d.title)}" data-forum="${d.forum ? 1 : 0}">${esc(d.title)} (${d.forum ? "group with topics" : d.kind})</option>`).join("")}</select></label>`
+            : avail.error ? "" : `<div class="small muted">All your channels and groups are already followed.</div>`}
+          ${avail.error ? `<div class="small warn">${esc(avail.error)}</div>` : ""}
+          <div class="small" style="margin-top:4px">${again}</div>`;
+      $("#add-sel")?.addEventListener("change", onPick);
+      // "Try again" picks up the list the server kept loading in the background; "Refresh" re-reads Telegram.
+      $("#add-refresh")?.addEventListener("click", (e) => { e.preventDefault(); loadAvailable(!avail.error); });
+    };
+    loadAvailable();
     $("#add-btn").addEventListener("click", async () => {
       const id = $("#add-id").value.trim(), title = $("#add-title").value.trim();
       if (!id || !title) return fail(new Error("Channel id and name are needed"));
@@ -917,7 +971,9 @@
 
   // --------------------------------------------------------------- settings
   async function renderSettings() {
+    const seq = S.nav;
     const L = await api("/limits");
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     const st = S.status;
     view.innerHTML = `<h1>Settings</h1>
       <h2>Automatic trading</h2>

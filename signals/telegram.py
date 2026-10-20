@@ -6,11 +6,16 @@ Runs its own asyncio loop in a background thread and hands messages to a callbac
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
+import time
 from pathlib import Path
 
 log = logging.getLogger("gold-trader.telegram")
+
+DIALOGS_TTL = 600       # seconds a cached channel list stays fresh
+CALL_TIMEOUT = 15       # seconds an API thread waits on Telegram before giving up
 
 
 class TelegramListener:
@@ -24,6 +29,13 @@ class TelegramListener:
         self.me = None
         self.error: str | None = None
         self._thread: threading.Thread | None = None
+        # Listing dialogs walks every chat on the account and can take many seconds (or hit a flood
+        # wait), so keep the last result and refresh it in the background instead of on each page load.
+        self._dialogs_cache: list[dict] | None = None
+        self._dialogs_at = 0.0
+        self._dialogs_fut: concurrent.futures.Future | None = None
+        self._topics_cache: dict[int, list[dict]] = {}
+        self._lock = threading.Lock()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="telegram", daemon=True)
@@ -58,6 +70,8 @@ class TelegramListener:
         self.me = await self.client.get_me()
         self.connected = True
         log.info("Telegram connected as %s", self.me.username or self.me.first_name)
+        with self._lock:   # prefetch the chat list now so the Channels page opens instantly
+            self._dialogs_fut = asyncio.run_coroutine_threadsafe(self._load_dialogs(), self.loop)
 
         @self.client.on(events.NewMessage())
         async def handler(event):
@@ -93,11 +107,40 @@ class TelegramListener:
 
     # -- called from API threads
 
-    def list_dialogs(self, limit: int = 200) -> list[dict]:
+    def list_dialogs(self, refresh: bool = False, timeout: float = CALL_TIMEOUT) -> tuple[list[dict], str | None]:
+        """(channels and groups, error). Answers from the cache when it has one and refreshes a stale
+        cache in the background. Waits (at most `timeout` seconds) only with no cache yet or on `refresh`."""
         if not self.connected:
-            return []
-        fut = asyncio.run_coroutine_threadsafe(self._dialogs(limit), self.loop)
-        return fut.result(timeout=30)
+            return [], None
+        with self._lock:
+            cached = self._dialogs_cache
+            stale = time.time() - self._dialogs_at > DIALOGS_TTL
+            if self._dialogs_fut is None and (cached is None or stale or refresh):
+                self._dialogs_fut = asyncio.run_coroutine_threadsafe(self._load_dialogs(), self.loop)
+            fut = self._dialogs_fut
+        if cached is not None and not refresh:
+            return cached, None
+        if fut is None:
+            return cached or [], None
+        try:
+            return fut.result(timeout=timeout), None
+        except concurrent.futures.TimeoutError:
+            return cached or [], "Telegram is slow to list your chats; still loading in the background, try again shortly"
+        except Exception as ex:
+            return cached or [], f"Could not load your chats: {ex}"
+
+    async def _load_dialogs(self, limit: int = 200) -> list[dict]:
+        try:
+            out = await self._dialogs(limit)
+            with self._lock:
+                self._dialogs_cache, self._dialogs_at = out, time.time()
+            return out
+        except Exception:
+            log.exception("could not list dialogs")
+            raise
+        finally:
+            with self._lock:
+                self._dialogs_fut = None
 
     async def _dialogs(self, limit: int) -> list[dict]:
         # Saved Messages: follow it to trade signals you post or forward there yourself.
@@ -108,12 +151,20 @@ class TelegramListener:
                             "username": getattr(d.entity, "username", None), "forum": bool(getattr(d.entity, "forum", False))})
         return out
 
-    def list_topics(self, chat_id: int) -> list[dict]:
+    def list_topics(self, chat_id: int, refresh: bool = False) -> list[dict]:
         """Topics (sub-groups) of a forum-style group. Empty for ordinary channels."""
         if not self.connected:
             return []
+        if chat_id in self._topics_cache and not refresh:
+            return self._topics_cache[chat_id]
         fut = asyncio.run_coroutine_threadsafe(self._topics(chat_id), self.loop)
-        return fut.result(timeout=30)
+        try:
+            topics = fut.result(timeout=CALL_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            fut.cancel()
+            raise TimeoutError("Telegram took too long to list the topics; try again") from None
+        self._topics_cache[chat_id] = topics
+        return topics
 
     async def _topics(self, chat_id: int) -> list[dict]:
         try:  # Telethon >= 1.45 keeps it under messages, older releases under channels

@@ -565,16 +565,20 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
         return [{**c.to_dict(), "feed": is_feed(c.id), "review": s.channel_review(c.id)} for c in s.channels()]
 
     @app.get("/api/channels/available", dependencies=[api])
-    def available_channels(s=Depends(sigs)):
+    def available_channels(refresh: bool = False, s=Depends(sigs)):
         if s.telegram is None or not s.telegram.connected:
-            return {"connected": False, "dialogs": []}
-        return {"connected": True, "dialogs": s.telegram.list_dialogs()}
+            return {"connected": False, "dialogs": [], "error": s.telegram.error if s.telegram else None}
+        dialogs, error = s.telegram.list_dialogs(refresh=refresh)
+        return {"connected": True, "dialogs": dialogs, "error": error}
 
     @app.get("/api/channels/{channel_id}/topics", dependencies=[api])
-    def channel_topics(channel_id: int, s=Depends(sigs)):
+    def channel_topics(channel_id: int, refresh: bool = False, s=Depends(sigs)):
         if s.telegram is None or not s.telegram.connected:
             return []
-        return s.telegram.list_topics(channel_id)
+        try:
+            return s.telegram.list_topics(channel_id, refresh=refresh)
+        except TimeoutError as ex:
+            raise HTTPException(504, str(ex))
 
     @app.put("/api/channels/{channel_id}", dependencies=[api])
     def save_channel(channel_id: int, body: ChannelIn, s=Depends(sigs)):
