@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -167,7 +169,12 @@ def test_topic_filter(env):
 def test_missing_sl_falls_back_to_preset_and_watch_is_recorded(env):
     client, trading, sigs, broker = env
     sigs.save_channel(Channel(CH, "Gold VIP", weight=5, mode="auto"))
+    sigs.cfg.wait_for_sl_s = 0.01
     sig = sigs.handle_message(CH, "Gold VIP", 1, "GOLD BUY no sl 2650 TP 2660")
+    assert sig.status == "waiting_sl"                                # waits for the channel's stop first
+    time.sleep(0.02)
+    sigs.tick()
+    sig = sigs._get(sig.id)
     assert sig.status == "placed", sig.error
     t = trading.store.trades[sig.ticket]
     assert t.settings.sl_pips == 50.0 and t.sl == 2645.30            # default 50 pips until the channel gives a stop
@@ -204,3 +211,73 @@ def test_channel_claims_feed_the_scorecard(env):
     assert rev["claims"] == 4 and rev["claimed_tp"] == 2 and rev["claimed_sl"] == 1
     assert rev["claimed_pips"] == 40 + 60 - 50 and rev["claimed_rate"] == 67
     assert rev["placed"] == 0
+
+
+FEED = "/api/feeds/market-watch/signals"
+
+
+def test_feed_signals_run_as_a_channel(env):
+    client, trading, sigs, broker = env
+    from signals import feed_channel_id
+    body = {"id": "4h-buy-1", "title": "Market Watch", "side": "buy", "entry": 2650, "sl": 2645,
+            "tps": [2655, 2660, 2670]}
+    r = client.post(FEED, json=body)
+    assert r.status_code == 200, r.text
+    sig = r.json()
+    assert sig["status"] == "pending" and sig["channel_title"] == "Market Watch"   # new feeds start in confirm
+    assert sig["text"] == "BUY XAUUSD @ 2650 SL 2645 TP1 2655 TP2 2660 TP3 2670"
+    assert [s["pips"] for s in sig["plan"]["settings"]["steps"]] == [47.0, 97.0, 197.0]
+    ch = client.get("/api/channels").json()[0]
+    assert ch["id"] == feed_channel_id("market-watch") and ch["feed"] is True and ch["mode"] == "confirm"
+    assert client.post(FEED, json=body).json()["id"] == sig["id"]                 # same id: not queued twice
+    again = client.post(FEED, json={**body, "id": "4h-buy-2"}).json()             # sender restarted, same idea
+    assert again["status"] == "ignored" and "Already waiting" in again["error"]
+    assert sigs.listened_ids() == []                                              # never sent to Telegram
+
+    # The feed withdraws the idea before it was tapped.
+    assert client.post(FEED, json={"id": "4h-buy-1:close", "action": "close"}).json()["status"] == "ignored"
+    assert sigs._get(sig["id"]).status == "dismissed"
+
+    # Auto mode: placed with the channel's weight and managed by P1-P3 like any trade.
+    sigs.save_channel(Channel(feed_channel_id("market-watch"), "Market Watch", weight=2, mode="auto"))
+    placed = client.post(FEED, json={**body, "id": "4h-buy-3"}).json()
+    assert placed["status"] == "placed" and trading.store.trades[placed["ticket"]].settings.lot == 0.02
+    walk(trading, broker, [2655.10])                                              # P1 +47 pips: half closed
+    assert broker.position(placed["ticket"]).volume == 0.01
+    closed = client.post(FEED, json={"id": "4h-buy-3:close", "action": "close"}).json()
+    assert closed["status"] == "applied" and broker.position(placed["ticket"]) is None
+    walk(trading, broker, [2655.10])                                              # engine books the close
+    assert client.get(f"/api/channels/{feed_channel_id('market-watch')}/review").json()["closed"] == 1
+
+
+def test_feed_reanchors_levels_to_broker_price(env):
+    client, trading, sigs, broker = env
+    # Sender priced off futures 12 dollars above our spot (mid 2650.15): distances are kept.
+    r = client.post(FEED, json={"id": "a", "side": "buy", "entry": 2662.15, "sl": 2657.15, "tps": [2667.15],
+                                "reanchor": True}).json()
+    assert r["status"] == "pending", r
+    assert r["parsed"]["sl"] == 2645.15 and r["parsed"]["tps"] == [2650.15 + 5]
+    assert r["plan"]["settings"]["sl_pips"] == 51.5                                # from ask 2650.30
+    assert any("shifted -120 pips" in w for w in r["plan"]["warnings"])
+
+
+def test_feed_validation_and_off(env):
+    client, trading, sigs, broker = env
+    from signals import feed_channel_id
+    assert client.post("/api/feeds/Bad Name/signals", json={"id": "x", "side": "buy"}).status_code == 400
+    assert client.post(FEED, json={"id": "x", "action": "open"}).status_code == 400
+    assert client.post(FEED, json={"id": "x", "action": "explode"}).status_code == 400
+    sigs.save_channel(Channel(feed_channel_id("market-watch"), "MW", mode="off"))
+    assert client.post(FEED, json={"id": "x", "side": "buy", "sl": 2645}).json() == {"status": "channel_off"}
+
+
+def test_feeds_work_without_a_parser(tmp_path):
+    trading = TradingService(SimBroker(bid=BID), SqliteStore(tmp_path / "n.db"), sim_walk=False)
+    sigs = SignalService(trading, None)
+    app = create_app(trading, token=TOKEN, run_loop=False, signals=sigs)
+    with TestClient(app, headers={"Authorization": f"Bearer {TOKEN}"}) as client:
+        assert client.get("/api/signals/status").json()["parser"] is False
+        assert client.post(FEED, json={"id": "a", "side": "sell", "sl": 2655}).json()["status"] == "pending"
+        assert client.post("/api/signals/test", json={"text": "GOLD BUY"}).status_code == 400
+    sigs.save_channel(Channel(CH, "Gold VIP", mode="auto"))
+    assert sigs.handle_message(CH, "Gold VIP", 1, "GOLD BUY 2650 SL 2645").status == "failed"

@@ -57,6 +57,16 @@ def validate(s: TradeSettings, info: SymbolInfo) -> tuple[list[str], list[str]]:
     if s.trailing and s.trail_pips <= 0:
         errors.append("Trailing step must be above 0 pips")
 
+    if s.be_trigger_pips is not None:
+        if s.be_trigger_pips <= 0:
+            errors.append("Breakeven trigger must be above 0 pips")
+        elif s.be_lock_pips < 0:
+            errors.append("Breakeven lock can't be negative")
+        elif s.be_trigger_pips - s.be_lock_pips < max(min_stop_pips, 1):
+            errors.append(f"Breakeven locks +{s.be_lock_pips:g}, too close to its trigger at +{s.be_trigger_pips:g}")
+    if not 0 <= s.hold_seconds <= 3600:
+        errors.append("Hold time must be between 0 and 3600 seconds")
+
     if not errors:
         vols = split_volumes(s.lot, [st.close_pct for st in s.steps], info.vol_min, info.vol_step)
         for i, (st, v) in enumerate(zip(s.steps, vols), 1):

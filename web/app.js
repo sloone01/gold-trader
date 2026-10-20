@@ -7,6 +7,7 @@
     token: localStorage.getItem("gt_token") || "",
     status: null, presets: [], history: [], events: [],
     route: "home", param: null, timer: null, sse: null,
+    nav: 0,              // bumped on every navigation; a page whose data arrives after you left drops it
     form: null,          // new-trade form state
     detailEdit: {},      // edits in progress on the trade detail page
   };
@@ -15,11 +16,20 @@
 
   async function api(path, opts = {}) {
     const headers = { Authorization: "Bearer " + S.token, ...(opts.body ? { "Content-Type": "application/json" } : {}) };
+    const write = opts.method && opts.method !== "GET";
+    const { timeout = write ? 60000 : 20000, ...init } = opts;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeout);
     let r;
     try {
-      r = await fetch("/api" + path, { ...opts, headers, body: opts.body ? JSON.stringify(opts.body) : undefined });
+      r = await fetch("/api" + path, { ...init, headers, signal: ctl.signal, body: opts.body ? JSON.stringify(opts.body) : undefined });
     } catch (e) {
+      if (e.name === "AbortError") {
+        throw new Error(write ? "The bot didn't answer in time. Check Home before trying again." : "The bot is taking too long to answer.");
+      }
       throw new Error("Can't reach the bot. Is the server running?");
+    } finally {
+      clearTimeout(timer);
     }
     if (r.status === 401) { showLogin(S.token ? "Token rejected" : ""); throw new Error("Not authorised"); }
     const data = r.status === 204 ? null : await r.json().catch(() => null);
@@ -89,6 +99,7 @@
     if (!st) return;
     setConn(st.connected && st.engine.last_tick > Date.now() / 1000 - 5);
     $("#sym").textContent = st.symbol;
+    document.querySelector('#tabs a[data-tab="markets"]')?.classList.toggle("hidden", !st.features?.markets);
     const q = st.quote;
     $("#quote").innerHTML = q ? `${fmt.price(q.bid, st.info.digits)}<small>${q.spread_pips} pip</small>` : "no quote";
   }
@@ -106,7 +117,7 @@
         if (navigator.vibrate && (kind === "closed" || kind === "error" || kind === "signal")) navigator.vibrate(200);
         notify(ev);
         refreshStatus();
-        if (kind === "signal" && (S.route === "signals" || S.route === "channels")) render();
+        if (kind === "signal" && S.route === "signals") render();
       });
     }
     es.onerror = () => setConn(false);
@@ -124,27 +135,40 @@
     S.route = route || "home";
     S.param = param || null;
     if (S.route === "trade" && !S.form) S.form = null;
-    const tab = { detail: "home", channels: "signals", presets: "settings" }[S.route] || S.route;
+    const tab = { detail: "home", channels: "signals", presets: "settings", asset: "markets", signal: "signals" }[S.route] || S.route;
     document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("on", a.dataset.tab === tab));
     S.detailEdit = {};
+    S.nav++;
+    if (S.route !== "home") view.innerHTML = `<div class="empty">Loading…</div>`;
     render();
   }
   window.addEventListener("hashchange", navigate);
 
   async function render() {
+    if (S.route !== "markets" && S.route !== "asset") view.dir = "ltr";
+    const seq = S.nav;
     try {
       switch (S.route) {
+        case "markets": return await renderMarkets();
+        case "signal": return await renderTimeline();
+        case "asset": return await renderAsset();
         case "home": return renderHome();
-        case "trade": return renderTradeForm();
-        case "detail": return renderDetail();
-        case "history": return renderHistory();
-        case "presets": return renderPresets();
-        case "signals": return renderSignals();
-        case "channels": return renderChannels();
-        case "settings": return renderSettings();
+        case "trade": return await renderTradeForm();
+        case "detail": return await renderDetail();
+        case "history": return await renderHistory();
+        case "presets": return await renderPresets();
+        case "signals": return await renderSignals();
+        case "channels": return await renderChannels();
+        case "settings": return await renderSettings();
         default: location.hash = "#/";
       }
-    } catch (e) { fail(e); }
+    } catch (e) {
+      if (seq !== S.nav) return;
+      if (view.querySelector(".empty") || !view.innerHTML) {
+        view.innerHTML = `<div class="empty">Couldn't load this page.<br><span class="small">${esc(e.message)}</span><br><button class="sm" id="retry-page" style="margin-top:10px">Try again</button></div>`;
+        $("#retry-page").addEventListener("click", () => { view.innerHTML = `<div class="empty">Loading…</div>`; render(); });
+      } else fail(e);
+    }
   }
 
   // ------------------------------------------------------------------- home
@@ -166,13 +190,14 @@
         <div>TP</div><div>${t.tp == null ? "none" : `${fmt.price(t.tp, d)} <span class="muted">(${fmt.pips(t.tp_pips)})</span>`}</div>
       </div>
       <div class="steps">${steps}</div>
+      ${t.settings.be_trigger_pips ? `<div class="small ${t.be_done ? "pos" : "muted"}" style="margin-top:6px">Breakeven at +${t.settings.be_trigger_pips} (lock +${t.settings.be_lock_pips})${t.be_done ? " · done" : ""}${t.settings.hold_seconds ? ` · hold ${t.settings.hold_seconds}s` : ""}</div>` : t.settings.hold_seconds ? `<div class="small muted" style="margin-top:6px">Steps hold ${t.settings.hold_seconds}s</div>` : ""}
       ${t.settings.trailing && t.steps[2].status === "hit" ? `<div class="small muted" style="margin-top:6px">Trailing every ${t.settings.trail_pips} pips · ${t.trail_k} move${t.trail_k === 1 ? "" : "s"}</div>` : ""}
     </div>`;
   }
 
   function renderHome() {
     const st = S.status;
-    if (!st) { if (!view.innerHTML) view.innerHTML = `<div class="empty">Connecting…</div>`; return; }
+    if (!st) { view.innerHTML = `<div class="empty">Connecting…</div>`; return; }
     const a = st.account;
     const open = st.open_trades;
     view.innerHTML = `
@@ -182,6 +207,7 @@
         <div class="stat"><div class="label">Today</div><div class="value ${fmt.cls(st.today_usd)}">${fmt.usd(st.today_usd)}</div></div>
         <div class="stat"><div class="label">Floating</div><div class="value ${fmt.cls(st.floating_usd)}">${fmt.usd(st.floating_usd)}</div></div>
       </div>
+      ${st.automation_paused ? `<div class="card small warn"><b>Automatic trading is paused.</b> Signals wait for your tap; open trades are still managed. <a href="#/settings">Resume in Settings</a></div>` : ""}
       ${!st.market_open ? `<p class="warn">Market closed: new trades are blocked.</p>` : ""}
       ${st.engine.last_error ? `<p class="error">Engine error: ${esc(st.engine.last_error)}</p>` : ""}
       ${st.engine.sim ? `<p class="warn">Simulator mode: no real money.</p>` : ""}
@@ -209,7 +235,7 @@
   function eventsHtml() {
     const evs = S.events.slice(-20).reverse();
     if (!evs.length) return `<div class="empty small">Nothing yet.</div>`;
-    return evs.map((e) => `<div class="event ${e.kind}"><span class="t">${fmt.time(e.ts)}</span><span class="m">#${e.ticket} ${esc(e.message)}</span></div>`).join("");
+    return evs.map((e) => `<div class="event ${e.kind}"><span class="t">${fmt.time(e.ts)}</span><span class="m">${e.ticket ? "#" + e.ticket + " " : ""}${esc(e.message)}</span></div>`).join("");
   }
 
   // ------------------------------------------------------------- trade form
@@ -242,7 +268,14 @@
       <table><thead><tr><th>Step</th><th>Trigger +pips</th><th>Close %</th><th>Move SL to +pips</th></tr></thead><tbody>${steps}</tbody></table>
       <div class="small muted" style="margin-top:6px">Move SL: 0 = breakeven, blank = don't move.</div>
       <div class="inline"><input type="checkbox" id="${prefix}-trail" ${s.trailing ? "checked" : ""}><label for="${prefix}-trail" style="margin:0;color:var(--text)">Trail after P3 every</label>
-        <input type="number" step="10" min="1" id="${prefix}-trailpips" value="${s.trail_pips}" style="width:90px;margin:0"><span>pips</span></div>`;
+        <input type="number" step="10" min="1" id="${prefix}-trailpips" value="${s.trail_pips}" style="width:90px;margin:0"><span>pips</span></div>
+      <h2>Breakeven & noise filter</h2>
+      <div class="grid3">
+        <label>Breakeven at +pips<input type="number" step="5" min="1" id="${prefix}-betrig" value="${s.be_trigger_pips ?? ""}" placeholder="off"></label>
+        <label>Lock +pips<input type="number" step="1" min="0" id="${prefix}-belock" value="${s.be_lock_pips ?? 1}"></label>
+        <label>Hold (seconds)<input type="number" step="5" min="0" max="3600" id="${prefix}-hold" value="${s.hold_seconds ?? 0}"></label>
+      </div>
+      <div class="small muted" style="margin-top:6px">Breakeven moves the stop to entry + lock once profit reaches the trigger, on its own, whatever P1 does (leave P1's "Move SL" blank so a quick +20 doesn't put you at breakeven). Hold: a step or the breakeven only fires after price stays past its level this many seconds, so spikes don't trigger it.</div>`;
   }
 
   function readSettings(root, prefix = "f") {
@@ -259,6 +292,9 @@
       })),
       trailing: $(`#${prefix}-trail`, root).checked,
       trail_pips: Number($(`#${prefix}-trailpips`, root).value),
+      be_trigger_pips: num($(`#${prefix}-betrig`, root).value),
+      be_lock_pips: Number($(`#${prefix}-belock`, root).value || 0),
+      hold_seconds: Number($(`#${prefix}-hold`, root).value || 0),
     };
   }
 
@@ -272,7 +308,9 @@
   }
 
   async function renderTradeForm() {
+    const seq = S.nav;
     if (!S.presets.length) S.presets = await api("/presets").catch(() => []);
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     if (!S.form) S.form = defaultForm();
     const f = S.form;
     view.innerHTML = `
@@ -341,9 +379,10 @@
 
   // ------------------------------------------------------------ trade detail
   async function renderDetail() {
-    const ticket = Number(S.param);
+    const ticket = Number(S.param), seq = S.nav;
     let t;
-    try { t = await api("/trades/" + ticket); } catch (e) { view.innerHTML = `<a class="back" href="#/">← Back</a><div class="empty">${esc(e.message)}</div>`; return; }
+    try { t = await api("/trades/" + ticket); } catch (e) { if (seq !== S.nav) return; view.innerHTML = `<a class="back" href="#/">← Back</a><div class="empty">${esc(e.message)}</div>`; return; }
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     const d = t.digits;
     const edit = S.detailEdit;   // keep what the user is typing across live refreshes
     const stepRows = t.settings.steps.map((s, i) => {
@@ -476,7 +515,9 @@
 
   // ---------------------------------------------------------------- history
   async function renderHistory() {
+    const seq = S.nav;
     const rows = await api("/history?limit=200");
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     const d = S.status?.info?.digits ?? 2;
     const total = rows.reduce((a, t) => a + (t.result_usd || 0), 0);
     const wins = rows.filter((t) => (t.result_usd || 0) > 0).length;
@@ -498,7 +539,9 @@
 
   // ---------------------------------------------------------------- presets
   async function renderPresets() {
+    const seq = S.nav;
     S.presets = await api("/presets");
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     const editing = S.param ? S.presets.find((p) => p.id === Number(S.param)) : null;
     if (S.param === "new" || editing) {
       const p = editing || { name: "", settings: defaultForm().settings };
@@ -524,20 +567,49 @@
     view.innerHTML = `<div class="row between"><h1>Presets</h1><a href="#/presets/new"><button class="sm primary">+ New</button></a></div>
       ${S.presets.map((p) => `<div class="card clickable" data-go="#/presets/${p.id}">
         <div class="row between"><h3>${esc(p.name)}</h3><span class="muted small">${fmt.lot(p.settings.lot)} lot · ${p.settings.stop_mode}${p.settings.sl_pips ? " " + p.settings.sl_pips : ""}</span></div>
-        <div class="small muted" style="margin-top:4px">${p.settings.steps.map((s, i) => `P${i + 1} +${s.pips}${s.close_pct ? ` ×${s.close_pct}%` : ""}${s.move_sl_pips == null ? "" : s.move_sl_pips === 0 ? " BE" : ` →+${s.move_sl_pips}`}`).join(" · ")}${p.settings.tp_pips ? ` · TP +${p.settings.tp_pips}` : ""}${p.settings.trailing ? ` · trail ${p.settings.trail_pips}` : ""}</div>
+        <div class="small muted" style="margin-top:4px">${p.settings.steps.map((s, i) => `P${i + 1} +${s.pips}${s.close_pct ? ` ×${s.close_pct}%` : ""}${s.move_sl_pips == null ? "" : s.move_sl_pips === 0 ? " BE" : ` →+${s.move_sl_pips}`}`).join(" · ")}${p.settings.tp_pips ? ` · TP +${p.settings.tp_pips}` : ""}${p.settings.trailing ? ` · trail ${p.settings.trail_pips}` : ""}${p.settings.be_trigger_pips ? ` · BE at +${p.settings.be_trigger_pips} (+${p.settings.be_lock_pips})` : ""}${p.settings.hold_seconds ? ` · hold ${p.settings.hold_seconds}s` : ""}</div>
       </div>`).join("")}`;
     view.querySelectorAll("[data-go]").forEach((el) => el.addEventListener("click", () => (location.hash = el.dataset.go)));
   }
 
   // ---------------------------------------------------------------- signals
-  const STATUS_CLS = { pending: "warn", placed: "pos", applied: "pos", failed: "neg", ignored: "muted", dismissed: "muted", new: "muted", watch: "warn", result: "muted" };
+  const STATUS_CLS = { pending: "warn", placed: "pos", applied: "pos", failed: "neg", ignored: "muted", dismissed: "muted", new: "muted", watch: "warn", result: "muted", waiting_sl: "warn", armed: "warn", expired: "muted" };
 
   function planSummary(sig, digits) {
     const p = sig.parsed || {}, plan = sig.plan || {};
-    if (plan.action) return `${plan.action.replace("_", " ")} on #${plan.ticket}${plan.close_pct ? ` (${plan.close_pct}%)` : ""}${plan.sl_pips != null ? ` → SL ${fmt.pips(plan.sl_pips)} pips` : ""}${plan.tp_pips != null ? ` → TP +${plan.tp_pips} pips` : ""}`;
+    if (plan.action) {
+      const on = (plan.tickets || (plan.ticket ? [plan.ticket] : [])).map((t) => "#" + t).join(", ") || "waiting entries";
+      const sl = plan.sl === "breakeven" ? " → SL to breakeven" : plan.sl != null ? ` → SL ${plan.sl}` : plan.sl_pips != null ? ` → SL ${fmt.pips(plan.sl_pips)} pips` : "";
+      return `${plan.action.replace("_", " ")} on ${on}${plan.close_pct ? ` (${plan.close_pct}%)` : ""}${sl}${plan.tp != null ? ` → TP ${plan.tp}` : plan.tp_pips != null ? ` → TP +${plan.tp_pips} pips` : ""}`;
+    }
     if (!plan.settings) return p.reason || "";
-    const s = plan.settings;
-    return `${plan.side.toUpperCase()} ${fmt.lot(plan.lot)} lot @ market ${fmt.price(plan.ref_price, digits)} · SL ${plan.sl_price} (${s.sl_pips} pips) · P ${s.steps.map((x) => "+" + x.pips).join(" / ")}${s.tp_pips ? ` · TP +${s.tp_pips}` : ""}`;
+    const s = plan.settings, legs = plan.legs || [];
+    const entry = legs.length > 1 ? `${legs.length} entries (${legs.map((l) => l.price == null ? "now" : l.price).join(" / ")})`
+      : legs[0] && legs[0].kind !== "market" ? `${legs[0].kind} @ ${legs[0].price}` : `@ market ${fmt.price(plan.ref_price, digits)}`;
+    return `${plan.side.toUpperCase()} ${fmt.lot(plan.lot)} lot ${entry} · SL ${plan.sl_price ?? "default"} (${s.sl_pips} pips)${plan.risk_usd != null ? ` · risk ${fmt.usd(-plan.risk_usd)}` : ""} · P ${s.steps.map((x) => "+" + x.pips).join(" / ")}${s.tp_pips ? ` · TP +${s.tp_pips}` : ""}`;
+  }
+
+  const AGENT_DESC = {
+    open_trade: (i) => `Open ${i.side.toUpperCase()} ${i.entry != null ? `${i.order_type} @ ${i.entry}${i.entry_high ? "-" + i.entry_high : ""}` : "at market"}, SL ${i.sl ?? "?"}, TP ${(i.tps || []).join(", ") || "?"}`,
+    wait_for_levels: (i) => `Wait for the stop and targets of a ${i.side.toUpperCase()}`,
+    update_levels: (i) => `Set levels on ${(i.targets || []).join(", ")}: SL ${i.sl ?? "-"}, TP ${(i.tps || []).join(", ") || "-"}`,
+    add_entry: (i) => `Add an entry to ${i.to} ${i.entry != null ? "@ " + i.entry : "at market"}`,
+    close: (i) => `${i.percent < 100 ? `Close ${i.percent}% of` : "Close"} ${(i.targets || []).join(", ")}`,
+    move_sl: (i) => `Move SL of ${(i.targets || []).join(", ")} to ${i.breakeven ? "breakeven" : i.price}`,
+    set_tp: (i) => `Set TP of ${(i.targets || []).join(", ")} to ${i.tp}`,
+    cancel_pending: (i) => `Cancel ${(i.targets || []).join(", ")}`,
+    ask_me: (i) => `Asks you: ${i.question}`,
+    no_action: (i) => `No action (${i.kind})`,
+  };
+  function agentHtml(sig) {
+    const a = sig.agent;
+    if (!a) return "";
+    const acts = (a.actions || []).map((x) => `<div>• ${esc((AGENT_DESC[x.tool] || ((i) => x.tool))(x.input))}${x.input.reason ? ` <span class="muted">— ${esc(x.input.reason)}</span>` : ""}</div>`).join("");
+    const refs = a.inputs?.refs ? "" : "";
+    return `<div class="agent-box small"><b>Agent${a.mode === "shadow" ? " (shadow)" : ""}${a.relearned ? " · after your lesson" : ""}:</b>${acts || ""}
+      ${a.error && !acts ? `<div class="error">${esc(a.error)}</div>` : ""}
+      ${(a.notes_saved || []).map((n) => `<div class="muted">Learned (${esc(n.scope)}): ${esc(n.text)}</div>`).join("")}
+      ${a.answered ? `<div class="muted">You answered: ${esc(a.answered.answer)}</div>` : ""}${refs}</div>`;
   }
 
   function signalCard(sig, digits) {
@@ -554,35 +626,59 @@
       ${p.action && p.action !== "ignore" && p.action !== "watch" && p.action !== "result" ? `<div class="small"><b>${p.action.replace("_", " ")}</b>${p.confidence ? ` <span class="muted">(${Math.round(p.confidence * 100)}% sure)</span>` : ""} — ${esc(planSummary(sig, digits))}</div>` : ""}
       ${(sig.plan?.warnings || []).map((w) => `<div class="warn small">${esc(w)}</div>`).join("")}
       ${sig.error ? `<div class="${sig.status === "ignored" ? "muted" : "error"} small">${esc(sig.error)}</div>` : ""}
+      ${sig.note ? `<div class="small" style="color:var(--blue)">${esc(sig.note)}</div>` : ""}
+      ${(sig.plan?.legs || []).length > 1 || (sig.plan?.legs?.[0]?.kind ?? "market") !== "market" ? `<div class="legs">${sig.plan.legs.map((l, i) => `<span class="leg ${l.status}">E${i + 1} ${l.price == null ? "now" : l.price} · ${fmt.lot(l.lot)} · ${l.status}${l.ticket ? " #" + l.ticket : ""}</span>`).join("")}</div>` : ""}
+      ${!pending && (sig.status === "waiting_sl" || (sig.plan?.legs || []).some((l) => l.status === "waiting")) ? `<div class="btns"><button class="ghost sm" data-dismiss="${sig.id}">${sig.status === "waiting_sl" ? "Cancel" : "Cancel waiting entries"}</button></div>` : ""}
       ${pending ? `<div class="btns">
         ${sig.plan?.settings ? `<input type="number" step="0.01" min="0.01" data-lot="${sig.id}" value="${sig.plan.lot}" style="flex:0 0 90px;margin:0" title="lot">` : ""}
         <button class="primary" data-place="${sig.id}">${sig.plan?.action ? "Apply" : "Place trade"}</button>
         <button class="ghost" data-dismiss="${sig.id}">Dismiss</button></div>` : ""}
-      ${sig.ticket && sig.status !== "pending" ? `<div class="small" style="margin-top:6px"><a href="#/detail/${sig.ticket}">Open trade #${sig.ticket} →</a></div>` : ""}
+      ${agentHtml(sig)}
+      <div class="row" style="margin-top:6px;gap:14px">${sig.ticket && sig.status !== "pending" ? `<a class="small" href="#/detail/${sig.ticket}">Trade #${sig.ticket} →</a>` : ""}${p.action && p.action !== "ignore" ? `<a class="small" href="#/signal/${sig.id}">Timeline →</a>` : ""}${S.agent?.available ? `<a class="small" href="#" data-teach="${sig.id}">Teach the agent</a>` : ""}</div>
+      <div id="teach-${sig.id}"></div>
     </div>`;
   }
 
   async function renderSignals() {
+    const seq = S.nav;
     const st = await api("/signals/status");
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     if (!st.enabled) {
       view.innerHTML = `<h1>Signals</h1><div class="card"><p>Telegram signals are not enabled on the server.</p>
         <p class="small muted">Add <code>ANTHROPIC_API_KEY</code>, <code>TG_API_ID</code> and <code>TG_API_HASH</code> to <code>.env</code>, run <code>py -m scripts.telegram_login</code> once on the VPS, then restart the server.</p></div>`;
       return;
     }
-    const [sigs, chans] = await Promise.all([api("/signals?limit=100"), api("/channels")]);
+    const [sigs, chans, agent] = await Promise.all([api("/signals?limit=100"), api("/channels"), api("/agent").catch(() => ({ available: false, questions: [] }))]);
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
+    S.agent = agent;
     const digits = S.status?.info?.digits ?? 2;
     const tg = st.telegram;
     const pending = sigs.filter((s) => s.status === "pending").reverse();
+    const working = sigs.filter((s) => s.status === "waiting_sl" || s.status === "armed").reverse();
     const watching = sigs.filter((s) => s.status === "watch" && s.ts > Date.now() / 1000 - 86400).reverse();
-    const rest = sigs.filter((s) => s.status !== "pending" && s.status !== "watch").reverse();
+    const rest = sigs.filter((s) => !["pending", "watch", "waiting_sl", "armed"].includes(s.status)).reverse();
     view.innerHTML = `
       <div class="row between"><h1>Signals</h1><a href="#/channels"><button class="sm">Channels (${chans.length})</button></a></div>
       <div class="small ${tg ? (tg.connected ? "pos" : "neg") : "warn"}" style="margin-bottom:10px">
         ${tg ? (tg.connected ? `Telegram connected as ${esc(tg.user || "")} · listening to ${chans.filter((c) => c.mode !== "off").length} channel(s)` : `Telegram not connected${tg.error ? ": " + esc(tg.error) : ""}`) : "Telegram not configured (TG_API_ID / TG_API_HASH)"}
       </div>
+      ${agent.questions.length ? `<h2>The agent asks (${agent.questions.length})</h2>${agent.questions.map((q) => `<div class="card agent-q">
+        <div class="row between"><b>${esc(q.channel_title)}</b><span class="muted small">${fmt.date(q.ts)}</span></div>
+        <div class="small muted" style="white-space:pre-wrap;margin:4px 0">${esc(q.text)}</div>
+        <div><b>${esc(q.question)}</b></div>
+        <textarea rows="2" data-answer-text="${q.signal_id}" placeholder="Your answer — it is saved as a lesson for this channel" class="ta"></textarea>
+        <div class="btns"><button class="primary sm" data-answer="${q.signal_id}">Answer</button></div></div>`).join("")}` : ""}
+      ${agent.available ? `<div class="small muted" style="margin-bottom:8px">Agent: <b>${agent.mode === "shadow" ? "shadow mode (shows what it would do)" : "off"}</b> · <a href="#/channels">settings & knowledge</a></div>` : ""}
       <h2>Waiting for you (${pending.length})</h2>
       ${pending.length ? pending.map((s) => signalCard(s, digits)).join("") : `<div class="card empty small">Nothing to confirm.</div>`}
+      ${working.length ? `<h2>Waiting for price or stop (${working.length})</h2>${working.map((s) => signalCard(s, digits)).join("")}` : ""}
       ${watching.length ? `<h2>Setups to watch (last 24h)</h2>${watching.map((s) => signalCard(s, digits)).join("")}` : ""}
+      <h2>Your own signal</h2>
+      <div class="card">
+        <textarea id="sig-own" rows="2" placeholder="e.g. buy gold 2650 sl 2640 tp 2660 2670 — handled as the My signals channel (its mode decides: confirm or auto)" style="width:100%;margin-top:0;padding:10px;font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:10px"></textarea>
+        <div class="btns"><button class="primary" id="sig-own-btn">Send</button></div>
+        <div class="small muted">You can also follow Telegram's <b>Saved Messages</b> as a channel and forward signals there from WhatsApp or anywhere.</div>
+      </div>
       <h2>Try a message</h2>
       <div class="card">
         <textarea id="sig-test" rows="3" placeholder="Paste a signal message to see how it would be read and traded (nothing is placed)" style="width:100%;margin-top:0;padding:10px;font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:10px"></textarea>
@@ -599,6 +695,37 @@
       if (r.status === "failed") throw new Error(r.error || "Failed");
     })));
     view.querySelectorAll("[data-dismiss]").forEach((b) => b.addEventListener("click", act(() => api(`/signals/${b.dataset.dismiss}/dismiss`, { method: "POST" }))));
+    view.querySelectorAll("[data-answer]").forEach((b) => b.addEventListener("click", async () => {
+      const id = b.dataset.answer, text = $(`[data-answer-text="${id}"]`).value.trim();
+      if (!text) return;
+      b.disabled = true; b.textContent = "Re-reading…";
+      try { await api(`/signals/${id}/answer`, { method: "POST", body: { text } }); toast("Thanks — lesson saved"); renderSignals(); } catch (e) { fail(e); b.disabled = false; b.textContent = "Answer"; }
+    }));
+    view.querySelectorAll("[data-teach]").forEach((a) => a.addEventListener("click", (e) => {
+      e.preventDefault();
+      const id = a.dataset.teach, box = $(`#teach-${id}`);
+      if (box.innerHTML) { box.innerHTML = ""; return; }
+      box.innerHTML = `<div class="teach">
+        <textarea rows="3" class="ta" id="teach-text-${id}" placeholder="What did it get wrong, and what does this message really mean? e.g. 'In this channel \"secure\" means close half and move SL to entry'"></textarea>
+        <div class="row" style="margin-top:6px"><select id="teach-scope-${id}" style="margin:0;width:auto"><option value="channel">This channel only</option><option value="shared">All channels</option></select>
+        <button class="primary sm" id="teach-go-${id}">Teach & re-read</button></div></div>`;
+      $(`#teach-go-${id}`).addEventListener("click", async (ev) => {
+        const text = $(`#teach-text-${id}`).value.trim();
+        if (!text) return;
+        ev.target.disabled = true; ev.target.textContent = "Re-reading…";
+        try { await api(`/signals/${id}/teach`, { method: "POST", body: { text, scope: $(`#teach-scope-${id}`).value } }); toast("Lesson saved"); renderSignals(); }
+        catch (err) { fail(err); ev.target.disabled = false; ev.target.textContent = "Teach & re-read"; }
+      });
+    }));
+    $("#sig-own-btn").addEventListener("click", async () => {
+      const text = $("#sig-own").value.trim();
+      if (!text) return;
+      try {
+        const r = await api("/signals/own", { method: "POST", body: { text } });
+        toast(`My signals: ${r.status}${r.error ? " · " + r.error : ""}`, r.status === "failed" ? "error" : "info");
+        renderSignals(); refreshStatus();
+      } catch (e) { fail(e); }
+    });
     $("#sig-test-btn").addEventListener("click", async () => {
       const text = $("#sig-test").value.trim();
       if (!text) return;
@@ -619,6 +746,30 @@
     });
   }
 
+  setInterval(() => {
+    const busy = document.activeElement && ["TEXTAREA", "INPUT", "SELECT"].includes(document.activeElement.tagName);
+    if (S.route === "signals" && document.visibilityState === "visible" && !busy && !document.querySelector(".teach")) renderSignals().catch(() => {});
+  }, 15000);
+
+  // --------------------------------------------------------------- timeline
+  async function renderTimeline() {
+    const tl = await api(`/signals/${S.param}/timeline`);
+    const digits = S.status?.info?.digits ?? 2;
+    const sig = tl.signal, items = [];
+    items.push({ ts: sig.ts, kind: "msg", html: `<b>${esc(sig.channel_title)}</b><div class="muted" style="white-space:pre-wrap">${esc(sig.text)}</div>` });
+    const p = sig.parsed || {};
+    if (p.action) items.push({ ts: sig.ts + 1e-6, kind: "read", html: `<b>Read as</b> ${esc(p.action)} ${p.side ? p.side.toUpperCase() : ""} ${p.order_type && p.order_type !== "market" ? esc(p.order_type) : ""} · entry ${p.entry ?? "market"}${p.entry_high ? "–" + p.entry_high : ""} · SL ${p.sl ?? "—"} · TP ${(p.tps || []).join(", ") || "—"}` });
+    if (sig.plan?.settings) items.push({ ts: sig.ts + 2e-6, kind: "plan", html: `<b>Plan</b> ${esc(planSummary(sig, digits))}${sig.note ? `<div style="color:var(--blue)">${esc(sig.note)}</div>` : ""}` });
+    for (const f of tl.followups) items.push({ ts: f.ts, kind: "msg", html: `<b>${esc(f.channel_title)}</b> <span class="small ${STATUS_CLS[f.status] || ""}">${esc(f.status)}</span><div class="muted" style="white-space:pre-wrap">${esc(f.text)}</div>${f.plan?.action ? `<div>→ ${esc(planSummary(f, digits))}</div>` : ""}${f.note ? `<div style="color:var(--blue)">${esc(f.note)}</div>` : ""}${f.error ? `<div class="error">${esc(f.error)}</div>` : ""}` });
+    for (const e of tl.events) items.push({ ts: e.ts, kind: e.kind, html: `<b>#${e.ticket}</b> ${esc(e.message)}` });
+    items.sort((a, b) => a.ts - b.ts);
+    view.innerHTML = `<a class="back" href="#/signals">← Signals</a><h1>Signal #${sig.id} · ${esc(sig.status)}</h1>
+      ${tl.trades.map((t) => tradeCard(t)).join("")}
+      <h2>Conversation</h2>
+      <div class="card timeline">${items.map((it) => `<div class="tl-item ${it.kind}"><span class="t">${fmt.date(it.ts)}</span><div class="small">${it.html}</div></div>`).join("")}</div>`;
+    view.querySelectorAll("[data-go]").forEach((el) => el.addEventListener("click", () => (location.hash = el.dataset.go)));
+  }
+
   // --------------------------------------------------------------- channels
   function reviewHtml(r) {
     if (!r || !r.signals) return `<div class="small muted">No signals seen yet.</div>`;
@@ -635,10 +786,14 @@
   }
 
   async function renderChannels() {
-    const [chans, cfg, avail] = await Promise.all([api("/channels"), api("/signals/settings"), api("/channels/available").catch(() => ({ connected: false, dialogs: [] }))]);
-    if (!S.presets.length) S.presets = await api("/presets").catch(() => []);
+    // Your Telegram chat list can be slow, so the page draws without it and fills the "Add" card when it arrives.
+    const seq = S.nav;
+    const [chans, cfg, agent] = await Promise.all([api("/channels"), api("/signals/settings"),
+      api("/agent").catch(() => ({ available: false, knowledge: { shared: [], channels: {} } })),
+      S.presets.length ? null : api("/presets").then((p) => { S.presets = p; }).catch(() => {})]);
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
+    const noteList = (notes) => (notes || []).map((n) => `<div class="note"><span>${esc(n.text)}${n.source === "you" ? ` <span class="pill">you</span>` : ` <span class="pill">agent</span>`}${n.example ? `<div class="muted">e.g. “${esc(n.example)}”</div>` : ""}</span><span class="row"><a href="#" data-note-edit="${n.id}" data-note-text="${esc(n.text)}">edit</a><a href="#" data-note-del="${n.id}">delete</a></span></div>`).join("") || `<div class="muted small">Nothing yet.</div>`;
     const known = new Set(chans.map((c) => c.id));
-    const addable = (avail.dialogs || []).filter((d) => !known.has(d.id));
     const weightSel = (v, id) => `<select data-w="${id}" style="margin:0">${[1, 2, 3, 4, 5].map((w) => `<option value="${w}" ${w === v ? "selected" : ""}>${"★".repeat(w)}${"☆".repeat(5 - w)} ${w}</option>`).join("")}</select>`;
     const modeSel = (v, id) => `<select data-m="${id}" style="margin:0">${["off", "confirm", "auto"].map((m) => `<option value="${m}" ${m === v ? "selected" : ""}>${m}</option>`).join("")}</select>`;
     const presetSel = (v, id) => `<select data-p="${id}" style="margin:0"><option value="">Default preset</option>${S.presets.map((p) => `<option value="${p.id}" ${p.id === v ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>`;
@@ -656,8 +811,34 @@
         </div>
         <div class="inline"><input type="checkbox" id="c-tps" ${cfg.use_signal_tps ? "checked" : ""}><label for="c-tps" style="margin:0;color:var(--text)">Use the signal's TP1–TP3 as P1–P3 distances (when it gives three)</label></div>
         <div class="inline"><input type="checkbox" id="c-final" ${cfg.final_tp ? "checked" : ""}><label for="c-final" style="margin:0;color:var(--text)">Also set the signal's last TP as a hard take profit</label></div>
+        <h3 style="margin-top:16px">Sizing</h3>
+        <div class="grid2">
+          <label>Lot size by<select id="c-sizing"><option value="weight" ${cfg.sizing === "weight" ? "selected" : ""}>Trust weight × lot per point</option><option value="risk" ${cfg.sizing === "risk" ? "selected" : ""}>Risk % of balance (from the stop)</option></select></label>
+          <label>Risk % per trust point<input type="number" step="0.05" min="0.05" id="c-riskpct" value="${cfg.risk_pct_per_weight}"></label>
+        </div>
+        <h3 style="margin-top:16px">Signals without a stop</h3>
+        <div class="grid2">
+          <label>Wait for the channel's SL (seconds, 0 = don't wait)<input type="number" step="15" min="0" id="c-wait" value="${cfg.wait_for_sl_s}"></label>
+          <label>If no SL comes<select id="c-nosl"><option value="default" ${cfg.no_sl_action === "default" ? "selected" : ""}>Enter with the default SL</option><option value="skip" ${cfg.no_sl_action === "skip" ? "selected" : ""}>Skip the signal</option></select></label>
+        </div>
+        <h3 style="margin-top:16px">Entry ladder</h3>
+        <div class="inline"><input type="checkbox" id="c-ladder" ${cfg.ladder ? "checked" : ""}><label for="c-ladder" style="margin:0;color:var(--text)">Split entries: zone edges, or deeper toward the stop (better average price)</label></div>
+        <div class="grid3">
+          <label>Entries<select id="c-legs">${[2, 3].map((n) => `<option ${n === cfg.ladder_legs ? "selected" : ""}>${n}</option>`).join("")}</select></label>
+          <label>Deepest at % to SL<input type="number" step="5" min="10" max="90" id="c-depth" value="${cfg.ladder_depth_pct}"></label>
+          <label>Cancel unfilled after (min)<input type="number" step="30" min="5" id="c-expiry" value="${cfg.ladder_expiry_min}"></label>
+        </div>
+        <div class="small muted">Buy/sell limit and stop orders always wait for their price, ladder or not.</div>
+        <h3 style="margin-top:16px">Signal agent</h3>
+        ${agent.available ? `<label>Agent<select id="c-agent"><option value="off" ${cfg.agent_mode !== "shadow" ? "selected" : ""}>Off</option><option value="shadow" ${cfg.agent_mode === "shadow" ? "selected" : ""}>Shadow: read every message and show what it would do (no trading)</option></select></label>
+          <div class="small muted">Uses ${esc(agent.model || "Claude")} on every channel message (roughly 1–3 cents each).</div>` : `<div class="small warn">Needs ANTHROPIC_API_KEY on the server.</div>`}
+        <h3 style="margin-top:16px">Breakeven armor</h3>
+        <div class="inline"><input type="checkbox" id="c-armor" ${cfg.be_on_tp_hit ? "checked" : ""}><label for="c-armor" style="margin:0;color:var(--text)">When the channel posts "TP1 hit", move its trades' stop to breakeven</label></div>
         <button class="wide primary" id="c-save">Save rules</button>
       </div>
+      ${agent.available ? `<h2>Agent knowledge · all channels</h2>
+      <div class="card small">${noteList(agent.knowledge.shared)}
+        <div class="row" style="margin-top:8px"><input id="note-shared" placeholder="Add a lesson for every channel" style="margin:0"><button class="sm" data-note-add="shared">Add</button></div></div>` : ""}
       <h2>Followed channels (${chans.length})</h2>
       ${chans.length ? chans.map((c) => `<div class="card">
         <div class="row between"><h3>${esc(c.title)}</h3><span class="muted small">${c.id}</span></div>
@@ -666,14 +847,16 @@
           <label>Mode${modeSel(c.mode, c.id)}</label>
           <label>Rules${presetSel(c.preset_id, c.id)}</label>
         </div>
-        <div class="small" style="margin-top:6px" id="topic-${c.id}">${(c.topics || []).length ? `Topics: <b>${c.topics.map((t) => esc(t.title || t.id)).join(", ")}</b> · <a href="#" data-topics="${c.id}">change</a>` : `Whole group · <a href="#" data-topics="${c.id}">pick topics</a>`}</div>
+        <div class="small" style="margin-top:6px" id="topic-${c.id}">${c.feed ? `Feed · signals pushed by another app over the API` : (c.topics || []).length ? `Topics: <b>${c.topics.map((t) => esc(t.title || t.id)).join(", ")}</b> · <a href="#" data-topics="${c.id}">change</a>` : `Whole group · <a href="#" data-topics="${c.id}">pick topics</a>`}</div>
         <div class="btns"><button class="primary sm" data-save="${c.id}" data-title="${esc(c.title)}">Save</button><button class="danger sm" data-del="${c.id}">Remove</button></div>
         ${reviewHtml(c.review)}
+        ${agent.available ? `<details class="small" style="margin-top:8px"><summary>Agent knowledge for this channel (${(agent.knowledge.channels[c.id] || []).length})</summary>
+          ${noteList(agent.knowledge.channels[c.id])}
+          <div class="row" style="margin-top:8px"><input id="note-${c.id}" placeholder="Add a lesson for ${esc(c.title)}" style="margin:0"><button class="sm" data-note-add="${c.id}">Add</button></div></details>` : ""}
       </div>`).join("") : `<div class="card empty small">No channels followed yet.</div>`}
       <h2>Add a channel</h2>
       <div class="card">
-        ${avail.connected ? (addable.length ? `<label>From your Telegram<select id="add-sel"><option value="">Choose…</option>${addable.map((d) => `<option value="${d.id}" data-title="${esc(d.title)}" data-forum="${d.forum ? 1 : 0}">${esc(d.title)} (${d.forum ? "group with topics" : d.kind})</option>`).join("")}</select></label>` : `<div class="small muted">All your channels and groups are already followed.</div>`)
-          : `<div class="small warn">Telegram is not connected, so the list can't be loaded. You can still add a channel by id (shown by <code>py -m scripts.telegram_login</code>).</div>`}
+        <div id="add-avail"><div class="small muted">Loading your Telegram channels…</div></div>
         <div class="grid2"><label>Channel id<input id="add-id" placeholder="-1001234567890"></label><label>Name<input id="add-title" placeholder="Gold VIP"></label></div>
         <div id="add-topic-wrap" class="hidden"><label>Topics (sub-groups): tick the ones to follow, none = whole group</label><div id="add-topics" class="small"></div></div>
         <div class="grid2"><label>Trust<select id="add-w">${[1, 2, 3, 4, 5].map((w) => `<option value="${w}" ${w === 3 ? "selected" : ""}>${w}</option>`).join("")}</select></label><label>Mode<select id="add-m"><option value="confirm">confirm</option><option value="auto">auto</option><option value="off">off</option></select></label></div>
@@ -684,10 +867,31 @@
       try {
         await api("/signals/settings", { method: "PUT", body: { lot_per_weight: Number($("#c-lot").value),
           max_entry_drift_pips: Number($("#c-drift").value), default_sl_pips: Number($("#c-dsl").value), model: $("#c-model").value.trim() || "claude-opus-5",
-          use_signal_tps: $("#c-tps").checked, final_tp: $("#c-final").checked } });
+          use_signal_tps: $("#c-tps").checked, final_tp: $("#c-final").checked,
+          sizing: $("#c-sizing").value, risk_pct_per_weight: Number($("#c-riskpct").value),
+          wait_for_sl_s: Number($("#c-wait").value), no_sl_action: $("#c-nosl").value,
+          ladder: $("#c-ladder").checked, ladder_legs: Number($("#c-legs").value), ladder_depth_pct: Number($("#c-depth").value),
+          ladder_expiry_min: Number($("#c-expiry").value), be_on_tp_hit: $("#c-armor").checked,
+          agent_mode: $("#c-agent")?.value || cfg.agent_mode || "off" } });
         reload("Rules saved");
       } catch (e) { fail(e); }
     });
+    view.querySelectorAll("[data-note-add]").forEach((b) => b.addEventListener("click", async () => {
+      const k = b.dataset.noteAdd, input = $(k === "shared" ? "#note-shared" : `#note-${k}`), text = input.value.trim();
+      if (!text) return;
+      try { await api("/agent/notes", { method: "POST", body: k === "shared" ? { text, scope: "shared" } : { text, scope: "channel", channel_id: Number(k) } }); reload("Lesson added"); } catch (e) { fail(e); }
+    }));
+    view.querySelectorAll("[data-note-del]").forEach((a) => a.addEventListener("click", async (e) => {
+      e.preventDefault();
+      if (!confirm("Delete this lesson?")) return;
+      try { await api(`/agent/notes/${a.dataset.noteDel}`, { method: "DELETE" }); reload("Deleted"); } catch (err) { fail(err); }
+    }));
+    view.querySelectorAll("[data-note-edit]").forEach((a) => a.addEventListener("click", async (e) => {
+      e.preventDefault();
+      const text = prompt("Edit lesson", a.dataset.noteText);
+      if (!text) return;
+      try { await api(`/agent/notes/${a.dataset.noteEdit}`, { method: "PATCH", body: { text } }); reload("Saved"); } catch (err) { fail(err); }
+    }));
     const ticked = (root) => [...root.querySelectorAll("input[type=checkbox][data-tid]:checked")].map((i) => ({ id: Number(i.dataset.tid), title: i.dataset.ttitle }));
     const topicBoxes = (topics, selected) => topics.map((t) => `<label class="inline" style="margin-top:6px"><input type="checkbox" data-tid="${t.id}" data-ttitle="${esc(t.title)}" ${selected.has(t.id) ? "checked" : ""}>${esc(t.title)}</label>`).join("");
     const topicOf = (id) => {
@@ -719,19 +923,42 @@
       if (!confirm("Stop following this channel?")) return;
       try { await api(`/channels/${b.dataset.del}`, { method: "DELETE" }); reload("Removed"); } catch (e) { fail(e); }
     }));
-    $("#add-sel")?.addEventListener("change", async (e) => {
+    const onPick = async (e) => {
       const o = e.target.selectedOptions[0];
       $("#add-id").value = o.value; $("#add-title").value = o.dataset.title || "";
       const wrap = $("#add-topic-wrap"), list = $("#add-topics");
       list.innerHTML = "";
       wrap.classList.add("hidden");
       if (o.dataset.forum === "1") {
+        list.innerHTML = `<span class="muted">Loading topics…</span>`;
+        wrap.classList.remove("hidden");
         try {
           const topics = await api(`/channels/${o.value}/topics`);
-          if (topics.length) { list.innerHTML = topicBoxes(topics, new Set()); wrap.classList.remove("hidden"); }
-        } catch (err) { fail(err); }
+          if (topics.length) list.innerHTML = topicBoxes(topics, new Set()); else { list.innerHTML = ""; wrap.classList.add("hidden"); }
+        } catch (err) { list.innerHTML = ""; wrap.classList.add("hidden"); fail(err); }
       }
-    });
+    };
+    const loadAvailable = async (refresh = false) => {
+      const box = $("#add-avail");
+      if (!box) return;
+      if (box.querySelector("a")) box.innerHTML = `<div class="small muted">${refresh ? "Refreshing" : "Loading"} your Telegram channels…</div>`;
+      let avail;
+      try { avail = await api("/channels/available" + (refresh ? "?refresh=1" : ""), { timeout: 30000 }); }
+      catch (e) { avail = { connected: true, dialogs: [], error: e.message }; }
+      if (seq !== S.nav || !document.body.contains(box)) return;
+      const addable = (avail.dialogs || []).filter((d) => !known.has(d.id));
+      const again = `<a href="#" id="add-refresh">${avail.error ? "Try again" : "Refresh list"}</a>`;
+      box.innerHTML = !avail.connected
+        ? `<div class="small warn">Telegram is not connected${avail.error ? ` (${esc(avail.error)})` : ""}, so the list can't be loaded. You can still add a channel by id (shown by <code>py -m scripts.telegram_login</code>).</div>`
+        : `${addable.length ? `<label>From your Telegram<select id="add-sel"><option value="">Choose…</option>${addable.map((d) => `<option value="${d.id}" data-title="${esc(d.title)}" data-forum="${d.forum ? 1 : 0}">${esc(d.title)} (${d.forum ? "group with topics" : d.kind})</option>`).join("")}</select></label>`
+            : avail.error ? "" : `<div class="small muted">All your channels and groups are already followed.</div>`}
+          ${avail.error ? `<div class="small warn">${esc(avail.error)}</div>` : ""}
+          <div class="small" style="margin-top:4px">${again}</div>`;
+      $("#add-sel")?.addEventListener("change", onPick);
+      // "Try again" picks up the list the server kept loading in the background; "Refresh" re-reads Telegram.
+      $("#add-refresh")?.addEventListener("click", (e) => { e.preventDefault(); loadAvailable(!avail.error); });
+    };
+    loadAvailable();
     $("#add-btn").addEventListener("click", async () => {
       const id = $("#add-id").value.trim(), title = $("#add-title").value.trim();
       if (!id || !title) return fail(new Error("Channel id and name are needed"));
@@ -744,9 +971,16 @@
 
   // --------------------------------------------------------------- settings
   async function renderSettings() {
+    const seq = S.nav;
     const L = await api("/limits");
+    if (seq !== S.nav) return;   // you moved to another page meanwhile
     const st = S.status;
     view.innerHTML = `<h1>Settings</h1>
+      <h2>Automatic trading</h2>
+      <div class="card">
+        <div class="row between"><div><b>${st?.automation_paused ? "Paused" : "On"}</b><div class="small muted">When paused, nothing opens or changes a trade by itself: auto channels wait for your tap, waiting entries stand still, the Markets auto-trader stops. P1–P3, breakeven and trailing on open trades keep running.</div></div></div>
+        <button class="wide ${st?.automation_paused ? "primary" : "danger"}" id="auto-toggle">${st?.automation_paused ? "Resume automatic trading" : "Pause all automatic trading"}</button>
+      </div>
       <h2>Risk limits</h2>
       <div class="card">
         <div class="grid2">
@@ -775,6 +1009,12 @@
         <p class="small muted">Alerts show while the app is open or in the background. Install the app from your browser menu ("Add to Home screen") for a full-screen experience.</p>
         <button class="wide danger" id="logout">Disconnect (forget token)</button>
       </div>`;
+    $("#auto-toggle").addEventListener("click", async () => {
+      try {
+        await api("/automation", { method: "PUT", body: { paused: !S.status?.automation_paused } });
+        await refreshStatus(); renderSettings();
+      } catch (e) { fail(e); }
+    });
     $("#l-save").addEventListener("click", async () => {
       try {
         await api("/limits", { method: "PUT", body: { max_lot: Number($("#l-lot").value),
@@ -790,6 +1030,245 @@
     });
     $("#logout").addEventListener("click", () => { localStorage.removeItem("gt_token"); S.token = ""; location.reload(); });
   }
+
+  // ---------------------------------------------------------------- markets
+  // Market Watch: signals and trade ideas for gold, silver, oil, forex and crypto. English / Arabic.
+  const M = {
+    lang: localStorage.getItem("mw_lang") || "en",
+    tf: localStorage.getItem("mw_tf") || "4h",
+    kind: localStorage.getItem("mw_kind") || "all",
+    sort: localStorage.getItem("mw_sort") || "score",
+    watchOnly: localStorage.getItem("mw_watch_only") === "1",
+    watch: new Set(JSON.parse(localStorage.getItem("mw_watch") || "[]")),
+    snap: null, at: 0,
+  };
+  const MT = {
+    en: {
+      title: "Markets", lang: "العربية", refresh: "Refresh", updated: "Updated", waiting: "Loading market data…",
+      demo: "Some prices are <b>demo data</b>. Set <code>TWELVEDATA_API_KEY</code> (metals, FX, oil) and <code>MARKETAUX_API_KEY</code> (news) in .env for live feeds.",
+      disclaimer: "Rule-based technical analysis. Not financial advice.",
+      buys: "Buy ideas", sells: "Sell ideas", bull: "Strongest buy", bear: "Strongest sell", movers: "Biggest movers",
+      none: "None above the threshold.", lean: "Lean, not active yet", empty: "No assets match these filters.",
+      kinds: { all: "All", metal: "Metals", energy: "Energy", forex: "Forex", crypto: "Crypto" },
+      sorts: { score: "Score", abs: "|Score|", change: "Move %", confidence: "Confidence", name: "Name" },
+      watchOnly: "Watchlist", watchAll: "All assets", conf: "conf", hit: "hit-rate", calibrated: "calibrated",
+      regimes: { trending: "trending", ranging: "range-bound" },
+      buy: "BUY", sell: "SELL", hold: "HOLD", entry: "Entry", stop: "Stop", target: "Target", rr: "R:R",
+      idea: "Trade idea", chart: "Price & overlays", summary: "Summary", weights: "Active weights",
+      indicators: "Indicators", built: "How the signal is built", news: "News & sentiment", noNews: "No recent headlines.",
+      composite: "Composite", scale: "−100 to +100", regime: "regime", agree: "agreement",
+      feed: "Gold idea → Market Watch channel", feedOff: "Gold feed off", holding: "holding", calendar: "High-impact news",
+      noEvents: "No high-impact events in the next 48 h.", flips: "Signal flips",
+      ind: ["Price", "RSI 14", "ADX 14", "SMA 20", "SMA 50", "EMA 20", "EMA 50", "MACD hist.", "ATR 14", "Support", "Resistance"],
+      comp: { trend: "Trend", rsi: "RSI", macd: "MACD", bollinger: "Bollinger", news: "News" },
+      channel: "Channel settings",
+    },
+    ar: {
+      title: "الأسواق", lang: "English", refresh: "تحديث", updated: "آخر تحديث", waiting: "جارٍ تحميل بيانات السوق…",
+      demo: "بعض الأسعار <b>بيانات تجريبية</b>. أضف <code>TWELVEDATA_API_KEY</code> و<code>MARKETAUX_API_KEY</code> في .env للبيانات الحية.",
+      disclaimer: "تحليل فني قائم على قواعد. ليس نصيحة مالية.",
+      buys: "أفكار شراء", sells: "أفكار بيع", bull: "أقوى شراء", bear: "أقوى بيع", movers: "الأكبر تحركًا",
+      none: "لا شيء فوق العتبة.", lean: "ميل، غير مفعّل بعد", empty: "لا أصول تطابق هذه الفلاتر.",
+      kinds: { all: "الكل", metal: "معادن", energy: "طاقة", forex: "عملات", crypto: "رقمية" },
+      sorts: { score: "الدرجة", abs: "|الدرجة|", change: "التحرك %", confidence: "الثقة", name: "الاسم" },
+      watchOnly: "المفضلة", watchAll: "كل الأصول", conf: "الثقة", hit: "الإصابة", calibrated: "معاير",
+      regimes: { trending: "اتجاهي", ranging: "نطاقي" },
+      buy: "شراء", sell: "بيع", hold: "انتظار", entry: "الدخول", stop: "الوقف", target: "الهدف", rr: "عائد/مخاطرة",
+      idea: "فكرة الصفقة", chart: "السعر والطبقات", summary: "الملخص", weights: "الأوزان النشطة",
+      indicators: "المؤشرات", built: "كيف تُبنى الإشارة", news: "الأخبار والمشاعر", noNews: "لا توجد عناوين حديثة.",
+      composite: "الدرجة المجمعة", scale: "من −100 إلى +100", regime: "النظام", agree: "التوافق",
+      feed: "فكرة الذهب ← قناة Market Watch", feedOff: "تغذية الذهب متوقفة", holding: "مركز", calendar: "أخبار عالية التأثير",
+      noEvents: "لا أحداث عالية التأثير خلال 48 ساعة.", flips: "تغيّر الإشارات",
+      ind: ["السعر", "القوة النسبية", "مؤشر الاتجاه", "متوسط 20", "متوسط 50", "أسي 20", "أسي 50", "هيستوغرام ماكد", "المدى الحقيقي", "الدعم", "المقاومة"],
+      comp: { trend: "الاتجاه", rsi: "القوة النسبية", macd: "ماكد", bollinger: "بولينجر", news: "الأخبار" },
+      channel: "إعدادات القناة",
+    },
+  };
+  const mt = (k) => MT[M.lang][k];
+  const SIG = { en: { bullish: "BUY", bearish: "SELL", neutral: "HOLD" }, ar: { bullish: "شراء", bearish: "بيع", neutral: "انتظار" } };
+  const KINDS = ["all", "metal", "energy", "forex", "crypto"];
+  const aname = (a) => (M.lang === "ar" ? a.name_ar : a.name);
+  const ltr = (s) => `<span dir="ltr">${s}</span>`;
+  const px = (n) => (n == null ? "—" : n >= 1000 ? Number(n).toLocaleString("en-US", { maximumFractionDigits: 2 }) : n >= 1 ? Number(n).toFixed(4) : Number(n).toFixed(6));
+  const n2 = (n, d = 2) => (n == null ? "—" : Number(n).toFixed(d));
+  const sgn = (n) => (n > 0 ? "+" : "") + n;
+  const scol = (label) => (label === "bullish" ? "var(--buy)" : label === "bearish" ? "var(--sell)" : "var(--muted)");
+  const mset = (k, v) => { M[k] = v; try { localStorage.setItem("mw_" + k, typeof v === "boolean" ? (v ? "1" : "0") : v); } catch (_) {} };
+
+  async function loadMarket(force = false) {
+    if (!force && M.snap && M.snap.timeframe.id === M.tf && Date.now() - M.at < 30000) return M.snap;
+    M.snap = await api(`/market?tf=${encodeURIComponent(M.tf)}`);
+    M.at = Date.now();
+    return M.snap;
+  }
+
+  function spark(vals, color) {
+    if (!vals || vals.length < 2) return "";
+    const w = 254, h = 40, min = Math.min(...vals), max = Math.max(...vals), r = max - min || 1;
+    const pts = vals.map((v, i) => `${(2 + (i / (vals.length - 1)) * (w - 4)).toFixed(1)},${(2 + (1 - (v - min) / r) * (h - 4)).toFixed(1)}`);
+    return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline fill="none" stroke="${color}" stroke-width="2" points="${pts.join(" ")}"/></svg>`;
+  }
+
+  function meter(score) {
+    const color = score >= 25 ? "var(--buy)" : score <= -25 ? "var(--sell)" : "var(--muted)";
+    const half = Math.min(Math.abs(score), 100) / 2;
+    return `<div class="meter"><div class="meter-mid"></div><div class="meter-fill" style="${score >= 0 ? "left" : "right"}:50%;width:${half}%;background:${color}"></div></div>`;
+  }
+
+  function overlay(ch) {
+    if (!ch || !ch.close || ch.close.length < 2) return "";
+    const w = 700, h = 220, pad = 10;
+    const all = [...ch.close, ...ch.sma20, ...ch.ema20, ...ch.bb_upper, ...ch.bb_lower].filter((v) => v != null);
+    const min = Math.min(...all), max = Math.max(...all), r = max - min || 1, n = ch.close.length;
+    const path = (arr) => arr.reduce((d, v, i) => (v == null ? d : d + `${d ? "L" : "M"}${(pad + (i / (n - 1)) * (w - pad * 2)).toFixed(1)},${(pad + (1 - (v - min) / r) * (h - pad * 2)).toFixed(1)} `), "");
+    const line = (arr, color, width, dash) => `<path d="${path(arr)}" fill="none" stroke="${color}" stroke-width="${width}" ${dash ? `stroke-dasharray="${dash}"` : ""}/>`;
+    return `<div class="chart"><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+      ${line(ch.bb_upper, "#5b6478", 1, "4 3")}${line(ch.bb_mid, "#5b6478", 1, "2 3")}${line(ch.bb_lower, "#5b6478", 1, "4 3")}
+      ${line(ch.sma20, "#5aa9ff", 1.5)}${line(ch.ema20, "#b48cff", 1.5)}${line(ch.close, "#e8eaf0", 2)}</svg>
+      <div class="legend small"><span style="color:#e8eaf0">■ Price</span><span style="color:#5aa9ff">■ SMA 20</span><span style="color:#b48cff">■ EMA 20</span><span style="color:#8b93a7">┄ Bollinger</span></div></div>`;
+  }
+
+  function sidePill(tr) {
+    if (tr?.active) return `<span class="side ${tr.side}">${mt(tr.side)}</span>`;
+    if (tr?.side) return `<span class="pill">${mt(tr.side)}…</span>`;
+    return `<span class="pill">${mt("hold")}</span>`;
+  }
+
+  function mwHeader(snap) {
+    const tfs = (snap?.timeframes || [{ id: "5m", label: "5M" }, { id: "15m", label: "15M" }, { id: "1h", label: "1H" }, { id: "4h", label: "4H" }, { id: "1d", label: "1D" }]);
+    return `<div class="row between"><h1>${mt("title")}</h1><div class="row"><button class="sm ghost" id="mw-lang">${mt("lang")}</button><button class="sm" id="mw-refresh">${mt("refresh")}</button></div></div>
+      <div class="seg" id="mw-tf">${tfs.map((t) => `<button data-tf="${t.id}" class="${t.id === M.tf ? "on" : ""}">${M.lang === "ar" ? t.label_ar || t.label : t.label}</button>`).join("")}</div>`;
+  }
+
+  function wireHeader() {
+    $("#mw-lang").onclick = () => { mset("lang", M.lang === "en" ? "ar" : "en"); render(); };
+    $("#mw-refresh").onclick = async (e) => {
+      e.target.disabled = true;
+      try { await api(`/market/refresh?tf=${M.tf}`, { method: "POST" }); await loadMarket(true); render(); } catch (err) { fail(err); e.target.disabled = false; }
+    };
+    document.querySelectorAll("#mw-tf button").forEach((b) => (b.onclick = () => { mset("tf", b.dataset.tf); render(); }));
+  }
+
+  function ideaCol(side, rows) {
+    const items = (rows || []).map((a) => `<div class="mw-row" data-asset="${a.id}">
+        <div class="row between"><b>${esc(aname(a))}</b><span style="color:${side === "buy" ? "var(--buy)" : "var(--sell)"}">${ltr(sgn(a.composite))}</span></div>
+        <div class="small muted">${a.active && a.entry != null ? `${mt("entry")} ${ltr(px(a.entry))} · ${mt("stop")} ${ltr(px(a.stop))} · ${mt("target")} ${ltr(px(a.target))} · ${mt("rr")} ${ltr(a.risk_reward)}` : mt("lean")}</div>
+      </div>`).join("");
+    return `<div class="card mw-col ${side}"><div class="row between"><h3>${mt(side === "buy" ? "buys" : "sells")}</h3><span class="side ${side}">${(rows || []).length}</span></div>${items || `<div class="small muted">${mt("none")}</div>`}</div>`;
+  }
+
+  function assetCard(a) {
+    const s = a.signal, col = scol(s.label), up = a.change_pct >= 0, on = M.watch.has(a.id);
+    return `<div class="card clickable mw-card" data-asset="${a.id}">
+      <div class="row between"><div class="row"><button class="star ${on ? "on" : ""}" data-star="${a.id}">★</button><b>${esc(aname(a))}</b>${a.demo_price ? `<span class="pill warn">demo</span>` : a.stale ? `<span class="pill">stale</span>` : ""}</div>
+        <span class="muted small">${esc(MT[M.lang].kinds[a.kind] || a.kind)}</span></div>
+      <div class="row between" style="margin-top:4px"><span class="big">${ltr(px(a.price))}</span><span class="${up ? "pos" : "neg"}">${up ? "▲" : "▼"} ${ltr(n2(Math.abs(a.change_pct)) + "%")}</span></div>
+      ${spark(a.spark, col)}
+      <div class="row"><span class="pill" style="color:${col}">${SIG[M.lang][s.label]}</span>${meter(s.composite)}<b style="color:${col}">${ltr(sgn(s.composite))}</b></div>
+      <div class="pills">${sidePill(s.trade)}<span class="pill">${mt("conf")} ${s.confidence}%</span><span class="pill">${MT[M.lang].regimes[s.regime.regime]}</span>${s.hit_rate ? `<span class="pill">${mt("hit")} ${s.hit_rate.rate}%</span>` : ""}<span class="pill">${esc(a.source)}</span></div>
+    </div>`;
+  }
+
+  function feedCard(snap) {
+    const f = snap.feed;
+    if (!f) return "";
+    if (!f.enabled) return `<div class="card small muted">${mt("feedOff")}</div>`;
+    const last = (f.actions || [])[0];
+    return `<a href="#/channels"><div class="card small clickable"><div class="row between"><b style="color:var(--gold)">${mt("feed")}</b><span class="muted">${f.timeframe}</span></div>
+      <div class="muted">${f.holding ? `${mt("holding")}: <span class="side ${f.holding.side}">${mt(f.holding.side)}</span> · ` : ""}${last ? `${esc(last.type)} ${esc(last.side || "")} → ${esc(last.status || "")}${last.reason ? " · " + esc(last.reason) : ""} · ${fmt.date(last.at)}` : "—"}${f.error ? ` · <span class="neg">${esc(f.error)}</span>` : ""}</div></div></a>`;
+  }
+
+  function autoCard(snap) {
+    const at = snap.autotrade, sb = snap.sweepbos, out = [];
+    if (at?.enabled) {
+      const label = { dry_run: "dry run (no orders)", demo: "DEMO account", live: "LIVE account", blocked_live: "blocked: live account" }[at.mode] || at.mode;
+      const last = (at.actions || [])[0];
+      out.push(`<div class="card small"><div class="row between"><b>Auto-trade · other assets</b><span class="pill ${at.mode === "live" || at.mode === "blocked_live" ? "warn" : ""}">${esc(label)}</span></div>
+        <div class="muted">TF ${esc(at.timeframe)} · gold is handled by the gold engine${at.paused?.length ? ` · paused: ${at.paused.map((p) => esc(p.symbol)).join(", ")}` : ""}${last ? ` · last: ${esc(last.type)} ${esc(last.symbol || "")} ${esc(last.side || "")}${last.reason ? " (" + esc(last.reason) + ")" : ""}` : ""}${at.error ? ` · <span class="neg">${esc(at.error)}</span>` : ""}</div></div>`);
+    }
+    if (sb?.enabled) {
+      out.push(`<div class="card small"><b>Sweep+BOS</b><div class="muted">${Object.entries(sb.watching || {}).map(([k, v]) => `${esc(k)}: ${esc(v)}`).join(" · ") || "scanning…"}</div></div>`);
+    }
+    return out.join("");
+  }
+
+  async function renderMarkets() {
+    if (!M.snap || M.snap.timeframe.id !== M.tf) view.innerHTML = mwHeader(M.snap) + `<div class="empty">${mt("waiting")}</div>`;
+    view.dir = M.lang === "ar" ? "rtl" : "ltr";
+    const snap = await loadMarket();
+    const cal = await api("/market/calendar?hours=48").catch(() => ({ upcoming: [] }));
+    if (S.route !== "markets") return;
+    let list = [...snap.assets];
+    if (M.kind !== "all") list = list.filter((a) => a.kind === M.kind);
+    if (M.watchOnly) list = list.filter((a) => M.watch.has(a.id));
+    const by = { score: (a, b) => b.signal.composite - a.signal.composite, abs: (a, b) => Math.abs(b.signal.composite) - Math.abs(a.signal.composite),
+      change: (a, b) => Math.abs(b.change_pct) - Math.abs(a.change_pct), confidence: (a, b) => b.signal.confidence - a.signal.confidence,
+      name: (a, b) => aname(a).localeCompare(aname(b), M.lang) };
+    list.sort(by[M.sort] || by.score);
+    const tri = snap.triage || {};
+    const triBlock = (title, rows, val) => `<div class="card mw-tri"><div class="small muted">${title}</div>${(rows || []).map((a) => `<div class="row between mw-row" data-asset="${a.id}"><span>${esc(aname(a))}</span><span style="color:${scol(a.label)}">${ltr(val(a))}</span></div>`).join("") || "—"}</div>`;
+    const flips = (snap.flips || []).slice(0, 4);
+    view.innerHTML = mwHeader(snap) + `
+      <div class="small muted" style="margin:8px 0">${snap.generated_at ? `${mt("updated")} ${fmt.time(snap.generated_at)}` : ""}${snap.calibration?.active ? ` · ${mt("calibrated")}` : ""} · ${mt("disclaimer")}</div>
+      ${snap.assets.some((a) => a.demo_price || a.demo_news) ? `<div class="card small warn">${mt("demo")}</div>` : ""}
+      ${feedCard(snap)}
+      ${autoCard(snap)}
+      ${flips.length ? `<div class="card small"><b>${mt("flips")}:</b> ${flips.map((f) => `${esc(M.lang === "ar" ? f.name_ar : f.name)} ${f.timeframe}: ${SIG[M.lang][f.from]} → <b>${SIG[M.lang][f.to]}</b>`).join(" · ")}</div>` : ""}
+      <div class="grid2">${ideaCol("buy", tri.buys)}${ideaCol("sell", tri.sells)}</div>
+      <div class="grid3">${triBlock(mt("bull"), tri.bullish, (a) => sgn(a.composite))}${triBlock(mt("bear"), tri.bearish, (a) => sgn(a.composite))}${triBlock(mt("movers"), tri.movers, (a) => sgn(n2(a.change_pct)) + "%")}</div>
+      <div class="chips">${KINDS.map((k) => `<button class="sm ${M.kind === k ? "on" : ""}" data-kind="${k}">${MT[M.lang].kinds[k]}</button>`).join("")}
+        <select id="mw-sort" style="width:auto;margin:0">${Object.entries(mt("sorts")).map(([k, v]) => `<option value="${k}" ${M.sort === k ? "selected" : ""}>${v}</option>`).join("")}</select>
+        <button class="sm ${M.watchOnly ? "on" : ""}" id="mw-watch">${M.watchOnly ? mt("watchAll") : mt("watchOnly")}</button></div>
+      ${list.map(assetCard).join("") || `<div class="card empty">${mt("empty")}</div>`}
+      <h2>${mt("calendar")}</h2>
+      <div class="card">${(cal.upcoming || []).map((e) => `<div class="event"><span class="t">${fmt.date(e.time)}</span><span class="m">${esc(e.currency)} · ${esc(e.title)}</span></div>`).join("") || `<div class="small muted">${mt("noEvents")}</div>`}</div>`;
+    wireHeader();
+    view.querySelectorAll("[data-asset]").forEach((el) => (el.onclick = (e) => { if (!e.target.closest("[data-star]")) location.hash = `#/asset/${el.dataset.asset}`; }));
+    view.querySelectorAll("[data-star]").forEach((b) => (b.onclick = (e) => {
+      e.stopPropagation();
+      const id = b.dataset.star;
+      M.watch.has(id) ? M.watch.delete(id) : M.watch.add(id);
+      try { localStorage.setItem("mw_watch", JSON.stringify([...M.watch])); } catch (_) {}
+      render();
+    }));
+    view.querySelectorAll("[data-kind]").forEach((b) => (b.onclick = () => { mset("kind", b.dataset.kind); render(); }));
+    $("#mw-sort").onchange = (e) => { mset("sort", e.target.value); render(); };
+    $("#mw-watch").onclick = () => { mset("watchOnly", !M.watchOnly); render(); };
+  }
+
+  async function renderAsset() {
+    view.dir = M.lang === "ar" ? "rtl" : "ltr";
+    const snap = await loadMarket();
+    const a = snap.assets.find((x) => x.id === S.param);
+    if (!a) { location.hash = "#/markets"; return; }
+    const s = a.signal, ind = a.indicators, tr = s.trade, col = scol(s.label);
+    const vals = [px(ind.price), n2(ind.rsi14, 1), n2(ind.adx14, 1), px(ind.sma20), px(ind.sma50), px(ind.ema20), px(ind.ema50),
+      ind.macd ? n2(ind.macd.histogram, 4) : "—", px(ind.atr14), ind.levels ? px(ind.levels.support) : "—", ind.levels ? px(ind.levels.resistance) : "—"];
+    const idea = tr?.active
+      ? `<div class="card"><div class="row between"><span class="side ${tr.side}">${mt(tr.side)}</span><span class="muted small">${mt("rr")} ${ltr(tr.risk_reward)}</span></div>
+          <div class="grid3">${[["entry", tr.entry], ["stop", tr.stop], ["target", tr.target]].map(([k, v]) => `<div class="stat"><div class="label">${mt(k)}</div><div class="value">${ltr(px(v))}</div></div>`).join("")}</div>
+          <p class="small muted">${esc(M.lang === "ar" ? tr.note.ar : tr.note.en)}</p>
+          ${a.id === "gold" ? `<a href="#/signals"><button class="wide">→ ${esc(mt("feed"))}</button></a>` : ""}</div>`
+      : `<div class="card small">${sidePill(tr)} ${esc(tr?.reason ? (M.lang === "ar" ? tr.reason.ar : tr.reason.en) : "")}</div>`;
+    view.innerHTML = `<a class="back" href="#/markets">← ${mt("title")}</a>
+      <div class="row between"><h1>${esc(aname(a))} <span class="pill" style="color:${col}">${SIG[M.lang][s.label]}</span></h1><button class="sm ghost" id="mw-lang">${mt("lang")}</button></div>
+      <p class="small muted">${mt("composite")} <b style="color:${col}">${ltr(sgn(s.composite))}</b> (${mt("scale")}) · ${mt("conf")} <b>${s.confidence}%</b> · ${mt("regime")} ${MT[M.lang].regimes[s.regime.regime]} · ${mt("agree")} ${ltr(`${s.agreement.aligned}/${s.agreement.total}`)}${s.hit_rate ? ` · ${mt("hit")} ${s.hit_rate.rate}% (${s.hit_rate.samples})` : ""} · ${a.timeframe} · ${esc(a.source)}</p>
+      <h2>${mt("idea")}</h2>${idea}
+      <h2>${mt("chart")}</h2><div class="card">${overlay(a.chart)}</div>
+      <h2>${mt("summary")}</h2><div class="card small">${esc(M.lang === "ar" ? s.summary.ar : s.summary.en)}</div>
+      <h2>${mt("weights")}</h2><div class="pills">${Object.entries(s.weights).map(([k, v]) => `<span class="pill">${mt("comp")[k] || k} ${Math.round(v * 100)}%</span>`).join("")}</div>
+      <h2>${mt("indicators")}</h2><div class="stats">${mt("ind").map((l, i) => `<div class="stat"><div class="label">${l}</div><div class="value small">${ltr(vals[i])}</div></div>`).join("")}</div>
+      <h2>${mt("built")}</h2>${Object.entries(s.components).filter(([, c]) => c).map(([k, c]) => `<div class="card small"><div class="row between"><b>${mt("comp")[k] || k}</b><span class="pill" style="color:${scol(c.label)}">${SIG[M.lang][c.label]}</span></div><div class="muted">${esc(M.lang === "ar" ? c.note_ar : c.note)}</div></div>`).join("")}
+      <h2>${mt("news")}${a.demo_news ? ` <span class="pill warn">demo</span>` : ""}</h2>
+      ${a.news.length ? a.news.map((nw) => { const v = nw.sentiment || 0, l = v >= 0.15 ? "bullish" : v <= -0.15 ? "bearish" : "neutral", t = M.lang === "ar" && nw.title_ar ? nw.title_ar : nw.title;
+        return `<div class="card small">${nw.url ? `<a href="${esc(nw.url)}" target="_blank" rel="noopener">${esc(t)}</a>` : esc(t)}<div class="row between muted"><span>${esc(nw.source || "")}</span><span style="color:${scol(l)}">${SIG[M.lang][l]} ${ltr(v.toFixed(2))}</span></div></div>`; }).join("")
+        : `<div class="card small muted">${mt("noNews")}</div>`}`;
+    $("#mw-lang").onclick = () => { mset("lang", M.lang === "en" ? "ar" : "en"); render(); };
+  }
+
+  setInterval(() => {
+    if (S.route === "markets" && document.visibilityState === "visible") loadMarket(true).then(() => S.route === "markets" && render()).catch(() => {});
+  }, 60000);
 
   // ------------------------------------------------------------------- boot
   async function boot(attempt = 0) {

@@ -26,9 +26,15 @@ async def run() -> None:
     session = os.environ.get("TG_SESSION", "telegram.session")
     client = TelegramClient(session, int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
     try:
-        await client.connect()
+        print("Connecting to Telegram…", flush=True)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=30)
+        except asyncio.TimeoutError:
+            raise SystemExit("Could not reach Telegram within 30 s. Check the VPS internet connection or firewall "
+                             "(outbound TCP 443/80 to Telegram) and try again.") from None
         if not await client.is_user_authorized():
             phone = input("Phone number with country code (e.g. +9689xxxxxxx): ").strip()
+            print("Asking Telegram to send a login code…", flush=True)
             await client.send_code_request(phone)
             code = input("Code Telegram sent to your app: ").strip()
             try:
@@ -41,10 +47,14 @@ async def run() -> None:
                     raise
         me = await client.get_me()
         print(f"\nLogged in as {me.first_name} (@{me.username}). Session saved to {session}.")
-        print("Channels and groups you are in:")
+        print("Channels and groups you are in (listing your chats, this can take a moment):", flush=True)
+        seen = 0
         async for d in client.iter_dialogs():
+            seen += 1
             if d.is_channel or d.is_group:
-                print(f"  {d.id:>16}  {d.name}")
+                print(f"  {d.id:>16}  {d.name}", flush=True)
+            elif seen % 50 == 0:
+                print(f"  … {seen} chats checked", flush=True)
         print("\nDone. Now restart the server:  powershell -ExecutionPolicy Bypass -File scripts\\restart_server.ps1")
     finally:
         await client.disconnect()
@@ -59,7 +69,7 @@ def main() -> None:
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
-        print("\nCancelled. Run the command again to log in.")
+        print("\nCancelled. If you were already logged in, the session is saved; otherwise run the command again.")
         return
     # Telethon's background tasks complain noisily when the loop closes on Python 3.14; nothing is wrong.
     os._exit(0)

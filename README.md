@@ -16,6 +16,15 @@ server/
   service.py      runs the engine loop in a thread, thread-safe calls for the API
   app.py          FastAPI routes (/api/...) + serves the web app, bearer-token auth
 web/              the phone app (PWA: vanilla JS, no build step)
+market/           Market Watch, built in (was the separate `trading` app)
+  providers.py    prices (MT5 candles for gold, Twelve Data, Yahoo, Binance, demo), news, economic calendar
+  indicators.py   SMA/EMA, RSI, MACD, Bollinger, ATR, ADX, swing support/resistance
+  signals.py      regime-aware composite score (-100..+100), confidence, buy/sell idea, EN/AR summary
+  calibrate.py    walk-forward weight calibration, saved in the database
+  service.py      background refresh per timeframe, flip alerts, the gold feed into Signals
+  autotrader.py   auto-trade for the non-gold assets (risk sizing, BE/trailing, filters)
+  sweepbos.py     Sweep+BOS strategy (gold setups become a Signals channel)
+  mt5_multi.py    any-symbol MT5 orders/positions/deals (the old bridge, in-process)
 signals/
   parser.py       Claude turns a Telegram message into a structured signal
   mapper.py       signal + channel trust + preset rules -> trade plan (lot by weight, Far SL, P1-P3)
@@ -66,8 +75,54 @@ How a signal becomes a trade:
 - **Weight** sets the lot: lot = weight × 0.01 (configurable), so weight 1 trades 0.01 and weight 5 trades 0.05. **Mode** decides what happens: `auto` places the trade immediately, `confirm` waits in **Signals → Waiting for you** with a Place button (you can change the lot before placing), `off` pauses the channel.
 - The SL comes from the signal (Far mode). P1–P3 come from the signal's TP1–TP3 when it gives three (toggle), otherwise from the channel's preset. Close percentages, SL moves and trailing always come from the preset: our rules, their levels.
 - Follow-ups from the same channel ("close half", "SL to breakeven", "close now", new TP) are matched to the last trade placed from that channel and applied the same way (auto or confirm).
+- **Follow-ups go to the right trade:** a message that *replies* to a signal acts on that signal's trades; otherwise on the channel's latest signal. Every entry of a ladder gets the follow-up.
+- **Breakeven armor:** when the channel posts "TP1 hit ✅", its open trades' stop moves to breakeven (toggle in Channels → Rules).
+- **No stop in the signal?** It waits (90 s by default) for the channel's "SL ..." message and then enters with it; if none comes it enters with the default stop, or skips (your choice).
+- **Risk sizing:** instead of weight × 0.01 lot, size by risk: weight × 0.25% of the balance (configurable), with the lot worked out from the stop distance, so a wide stop trades smaller. The plan shows the $ at risk.
+- **Entry ladder (optional):** split the lot over 2–3 entries: the edges of a zone ("buy 2640-2650"), or deeper toward the stop. Entries wait for their price, are cancelled after a few hours, when the stop is hit first, or when the channel closes or reports a TP. **Buy/sell limit and stop orders** always wait for their price instead of entering at market.
+- **Your own signals:** type one on the Signals screen (it goes through the "My signals" channel), or follow Telegram's **Saved Messages** as a channel and forward signals there from WhatsApp or anywhere.
+- **Timeline:** every signal has a timeline page: the message, how it was read, the plan, each fill, the follow-ups and channel results, and every engine event on its trades.
 - Each channel has a **scorecard** (signals, placed, win rate, pips, $) so you can raise or lower its weight as it proves itself. After 10 closed trades it suggests a direction.
 - **Try a message** on the Signals screen parses any text without trading, to check how a channel's style is read.
+
+### Markets (Market Watch, built in)
+
+The **Markets** tab is the former Market Watch app, now part of Gold Trader: gold, silver, oil, EUR/USD, GBP/USD, USD/JPY, Bitcoin and Ethereum on 5M / 15M / 1H / 4H / 1D, each with a composite score (−100…+100), confidence, regime, walk-forward hit rate, a buy/sell idea (entry, stop, target), indicators, an overlay chart, news sentiment and a plain-language summary, in English or Arabic.
+
+- Works with no keys (demo data, labelled). Gold uses the MT5 terminal's own candles, so the analysis sees the prices you trade at. Set `TWELVEDATA_API_KEY` and `MARKETAUX_API_KEY` for live metals/FX/oil and news; crypto comes from Binance.
+- **The gold idea is a channel.** On the feed timeframe (`MW_FEED_TIMEFRAME`, 4h), a gold buy/sell idea goes to **Signals** as the "Market Watch" channel: confirm mode at first, then auto once you trust it, with its own weight, preset and scorecard, and the engine manages it with P1–P3, trailing and your limits. A flip closes the trade and opens the other side; no entries during high-impact news.
+- Signal flips show up in the event feed, and optionally as Telegram bot messages (`MW_ALERT_BOT_TOKEN` / `MW_ALERT_CHAT_ID`).
+- **Sweep+BOS** (`SWEEP_BOS_ENABLED`): 4H structure, 1H zones, a 5M liquidity sweep and break of structure. Gold setups arrive in Signals as their own "Sweep+BOS" channel, with their own trust weight and scorecard.
+- **Auto-trade for the other assets** (`AUTO_TRADE_ENABLED`, off by default): silver, oil, forex and crypto ideas become MT5 orders through the same terminal, sized by risk % per signal level, with break-even and trailing stops, optional partial TPs, a higher-timeframe trend check, news blackout, session block hours and a losing-streak pause. Starts in `dry_run`; refuses real accounts unless `AUTO_TRADE_ALLOW_LIVE=true`. Gold is never traded here.
+
+**Moving over from the old `trading` app:** copy your keys and `AUTO_TRADE_*` / `SWEEP_BOS_*` / `MT5_SYMBOL_*` lines into this `.env`. `AUTO_TRADE_MODE=bridge` now means `mt5`, and the separate MT5 bridge, `GOLD_TRADER_*` settings and Node server are no longer needed. `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` still work for flip alerts. The old backtest scripts (`scripts/backtest*.js`) were not ported.
+
+### The signal agent (shadow mode)
+
+One Claude agent (Claude Opus 5.5) reads every channel message the way a person would: with the channel's open trades (T1, T2…) and waiting signals (W1…), its recent conversation, and what it has learned. It answers with decisions: open, wait for the levels, add an entry, close the old one and keep the new one, move the stop, set a TP, cancel, ask you, or nothing.
+
+- **Shadow mode** (Signals → Channels → Rules → Signal agent): every message shows the agent's reading next to what was actually done. Nothing trades differently yet; this is for checking it before it's trusted with real decisions.
+- **It learns in two places:** shared knowledge (true for every channel) and per-channel notes (one channel's habits). It saves its own notes; yours are marked "you" and override its habits. All of them are listed, editable and deletable on the Channels screen.
+- **Teach it** on any signal (ignored or not): say what it misread and whether the lesson is for this channel or all channels. The lesson is saved with the message as an example, and the agent re-reads the message at once so you see if it now gets it.
+- **It asks you** when a message is too unclear: the question appears at the top of Signals (and as a notification); your answer becomes a lesson and it re-reads the message.
+- Needs `ANTHROPIC_API_KEY`; roughly 1–3 cents per message. `GT_AGENT_MODEL` changes the model.
+
+### Feeds: signals from another app
+
+Another program can push structured signals instead of Telegram messages, and each sender is handled as a channel: it shows up in **Signals → Channels** with its own trust weight, mode, preset and scorecard, and its trades get the same P1–P3, trailing and risk limits. Market Watch (the `trading` repo) uses this for its gold ideas.
+
+```
+POST /api/feeds/market-watch/signals          Authorization: Bearer <GT_TOKEN>
+{"id": "4h-buy-1729080000000", "title": "Market Watch", "side": "buy",
+ "entry": 2650, "sl": 2645, "tps": [2655, 2660, 2670], "reanchor": true}
+{"id": "4h-buy-1729080000000:close", "action": "close"}
+```
+
+- A new feed starts in **confirm** mode at weight 3; switch it to `auto` in the app once you trust it. No `ANTHROPIC_API_KEY` is needed for feeds.
+- `id` must be unique per message; resending the same id returns the stored signal, so senders can retry safely.
+- One trade per side per feed: a repeated buy while a buy from that feed is open (or waiting for your tap) is ignored.
+- `close` closes the feed's open trade, and withdraws an open signal still waiting for a tap. `close_partial`, `move_sl` and `modify_tp` work as for Telegram follow-ups.
+- `reanchor: true` keeps the distances from the sender's entry but moves the levels onto the broker's price (for senders whose prices come from futures or another feed).
 
 ### Reaching it from outside the VPS
 
@@ -91,6 +146,21 @@ The token is the only lock on the door, so keep it long and private. Use a demo 
 | GET | /api/history · /api/events · /api/events/stream | closed trades · alert feed · SSE |
 | GET/POST/PUT/DELETE | /api/presets | presets |
 | GET/PUT | /api/limits | max lot, daily loss, max spread |
+| GET | /api/market?tf=4h · /api/market/assets/{id} | Markets snapshot · one asset |
+| POST | /api/market/refresh?tf= | refresh now (rate-limited) |
+| GET | /api/market/calendar · /api/market/feed | high-impact news · gold feed status |
+| GET | /api/market/autotrade · /api/market/performance?days=7&strategy=main\|sweepbos | auto-trader / Sweep+BOS status · closed-trade stats |
+| POST | /api/feeds/{feed}/signals | structured signal from another app, handled as a channel (see Feeds) |
+
+### Breakeven rule and hold time (in every preset)
+
+- **Breakeven at +X pips (lock +Y):** moves the stop to entry + Y once profit reaches X, separately from the steps. Leave P1's "Move SL" blank and P1 still takes profit at +20, but the rest of the trade keeps its stop through a normal pullback; it only goes to breakeven once the move has gone further.
+- **Hold (seconds):** a step or the breakeven rule fires only after price has stayed past its level this long, so a 1-second spike to +20 doesn't trigger it.
+- The built-in **"Hold the runner"** preset (new installs) shows it: P1 +20 closes half without moving the stop, breakeven +5 at +40, 15 s hold.
+
+### Pausing automatic trading
+
+**Settings → Automatic trading → Pause** stops everything that would open or change a trade by itself: auto channels wait for your tap, waiting ladder/limit entries stand still, breakeven-on-"TP1 hit" waits, the Markets auto-trader and Sweep+BOS stop. P1–P3, breakeven and trailing on trades already open keep running. Markets is off unless `MW_ENABLED=true` (the tab is hidden while it's off).
 
 ## Defaults (change in `engine/engine.py` or `.env`)
 

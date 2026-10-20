@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import queue
+import re
 import secrets
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -52,11 +53,15 @@ class SettingsIn(BaseModel):
                                                          StepIn(pips=100, close_pct=0, move_sl_pips=50)])
     trailing: bool = True
     trail_pips: float = 50.0
+    be_trigger_pips: float | None = None   # breakeven rule: move SL to entry + be_lock_pips at this profit
+    be_lock_pips: float = 1.0
+    hold_seconds: float = 0.0              # steps / breakeven fire only after price holds past the level
 
     def to_settings(self) -> TradeSettings:
         return TradeSettings(lot=self.lot, stop_mode=self.stop_mode, sl_pips=self.sl_pips, tp_pips=self.tp_pips,
                              steps=[StepConfig(s.pips, s.close_pct, s.move_sl_pips) for s in self.steps],
-                             trailing=self.trailing, trail_pips=self.trail_pips)
+                             trailing=self.trailing, trail_pips=self.trail_pips, be_trigger_pips=self.be_trigger_pips,
+                             be_lock_pips=self.be_lock_pips, hold_seconds=self.hold_seconds)
 
 
 class OpenIn(BaseModel):
@@ -114,19 +119,22 @@ def build_service() -> TradingService:
 
 
 def build_signals(trading: TradingService):
-    """Signal service + Telegram listener, when configured. Returns None when ANTHROPIC_API_KEY is missing."""
+    """Signal service, plus the Telegram listener when configured. Feeds (signals pushed by other
+    apps) always work; reading Telegram messages needs ANTHROPIC_API_KEY."""
     from signals import SignalService
-    from signals.parser import ClaudeParser
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        log.warning("ANTHROPIC_API_KEY not set: Telegram signals disabled")
-        return None
+        log.warning("ANTHROPIC_API_KEY not set: Telegram signals disabled (feeds still work)")
+        return SignalService(trading, None)
+    from signals.agent import Knowledge, SignalAgent
+    from signals.parser import ClaudeParser
     saved = trading.store.get_setting("signals") or {}
     sigs = SignalService(trading, ClaudeParser(model=saved.get("model", "claude-opus-5")))
+    sigs.agent = SignalAgent(Knowledge(trading.store), model=os.environ.get("GT_AGENT_MODEL", "claude-opus-5-5"))
     api_id, api_hash = os.environ.get("TG_API_ID"), os.environ.get("TG_API_HASH")
     if api_id and api_hash:
         from signals.telegram import TelegramListener
         sigs.telegram = TelegramListener(int(api_id), api_hash, os.environ.get("TG_SESSION", "telegram.session"),
-                                         sigs.handle_message, [c.id for c in sigs.channels() if c.mode != "off"])
+                                         sigs.handle_message, sigs.listened_ids())
         sigs.telegram.start()
     else:
         log.warning("TG_API_ID / TG_API_HASH not set: Telegram listener disabled (parsing test still works)")
@@ -153,6 +161,16 @@ class SignalSettingsIn(BaseModel):
     max_entry_drift_pips: float
     default_sl_pips: float = 50.0
     model: str = "claude-opus-5"
+    sizing: str = "weight"
+    risk_pct_per_weight: float = 0.25
+    wait_for_sl_s: float = 90.0
+    no_sl_action: str = "default"
+    ladder: bool = False
+    ladder_legs: int = 3
+    ladder_depth_pct: float = 50.0
+    ladder_expiry_min: float = 240.0
+    be_on_tp_hit: bool = True
+    agent_mode: str = "off"
 
 
 class TestParseIn(BaseModel):
@@ -160,12 +178,73 @@ class TestParseIn(BaseModel):
     channel_id: int | None = None
 
 
+class TeachIn(BaseModel):
+    text: str = Field(min_length=1, max_length=600)
+    scope: str = "channel"          # channel | shared
+
+
+class NoteIn(BaseModel):
+    text: str = Field(min_length=1, max_length=600)
+    scope: str = "channel"
+    channel_id: int | None = None
+
+
+class AutomationIn(BaseModel):
+    paused: bool
+
+
+class OwnSignalIn(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+
+
 class PlaceIn(BaseModel):
     lot: float | None = None
 
 
+class FeedSignalIn(BaseModel):
+    id: str = Field(min_length=1, max_length=200)   # unique per message: a resend with the same id is ignored
+    action: str = "open"                            # open | close | close_partial | move_sl | modify_tp
+    side: Side | None = None
+    entry: float | None = None
+    sl: float | None = None
+    tps: list[float] = Field(default_factory=list)
+    close_pct: float | None = None
+    move_sl_to: str | None = None                   # "breakeven" or a price
+    note: str = ""
+    title: str | None = None                        # channel name used when the feed is first seen
+    confidence: float = 1.0
+    reanchor: bool = False                          # shift entry/SL/TPs onto our price, keeping their distances
+
+
+FEED_KEY = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+
+
+def build_market(trading: TradingService, signals):
+    """Markets: the dashboard and gold feed always; the non-gold auto-trader and Sweep+BOS when enabled.
+    Orders for other symbols need the MT5 broker (GT_BROKER=mt5)."""
+    from market import MarketConfig, MarketService, providers
+    from market.autotrader import AutoTradeConfig, AutoTrader
+    from market.sweepbos import SweepBos, SweepBosConfig
+    cfg = MarketConfig.from_env()
+    if not cfg.enabled:
+        return None
+    at_cfg, sb_cfg = AutoTradeConfig.from_env(), SweepBosConfig.from_env()
+    mt = None
+    if os.environ.get("GT_BROKER", "mt5").lower() == "mt5" and (
+            (at_cfg.enabled and at_cfg.mode == "mt5") or (sb_cfg.enabled and set(sb_cfg.assets) - {"gold"})):
+        from market.mt5_multi import MT5Multi
+        mt = MT5Multi(allow_live=at_cfg.allow_live)
+    market = MarketService(cfg, trading, signals)
+    if at_cfg.enabled:
+        market.autotrader = AutoTrader(at_cfg, market, mt, news_blackout=lambda aid: providers.news_blackout(aid, cfg))
+        market.autotrader.extra_magics = (sb_cfg.magic,)
+    if sb_cfg.enabled:
+        market.sweepbos = SweepBos(sb_cfg, market, signals, mt, at_cfg.symbols)
+    return market
+
+
 def create_app(service: TradingService | None = None, token: str | None = None, run_loop: bool = True,
-               signals=None) -> FastAPI:
+               signals=None, market=None) -> FastAPI:
     token = os.environ.get("GT_TOKEN", "").strip() if token is None else token
     if not token:
         log.warning("GT_TOKEN is empty: the API and dashboard are OPEN to anyone who can reach this server")
@@ -174,12 +253,22 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     async def lifespan(app: FastAPI):
         app.state.service = service or build_service()
         app.state.signals = signals if signals is not None else (build_signals(app.state.service) if service is None else None)
+        app.state.market = market if market is not None else (
+            build_market(app.state.service, app.state.signals) if service is None else None)
         if run_loop:
             app.state.service.start()
+            if app.state.signals:
+                app.state.signals.start()
+            if app.state.market:
+                app.state.market.start()
         yield
         app.state.service.stop()
-        if app.state.signals and app.state.signals.telegram:
-            app.state.signals.telegram.stop()
+        if app.state.market:
+            app.state.market.stop()
+        if app.state.signals:
+            app.state.signals.stop()
+            if app.state.signals.telegram:
+                app.state.signals.telegram.stop()
 
     app = FastAPI(title="Gold Trader", lifespan=lifespan)
 
@@ -198,6 +287,12 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
         if s is None:
             raise HTTPException(503, "Signals are disabled: set ANTHROPIC_API_KEY (and TG_API_ID/TG_API_HASH) in .env")
         return s
+
+    def mkt(request: Request):
+        m = request.app.state.market
+        if m is None:
+            raise HTTPException(503, "Market Watch is off (MW_ENABLED=false)")
+        return m
 
     def auth(request: Request) -> None:
         if not token:
@@ -223,8 +318,13 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     # -- status
 
     @app.get("/api/status", dependencies=[api])
-    def status(s: TradingService = Depends(svc)):
-        return s.status()
+    def status(request: Request, s: TradingService = Depends(svc)):
+        return {**s.status(), "features": {"markets": request.app.state.market is not None,
+                                           "signals": request.app.state.signals is not None}}
+
+    @app.put("/api/automation", dependencies=[api])
+    def set_automation(body: AutomationIn, s: TradingService = Depends(svc)):
+        return {"paused": s.set_automation_paused(body.paused)}
 
     # -- trades
 
@@ -349,7 +449,7 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
         if s is None:
             return {"enabled": False, "telegram": None, "settings": None}
         tg = s.telegram
-        return {"enabled": True, "settings": s.cfg.to_dict(),
+        return {"enabled": True, "settings": s.cfg.to_dict(), "parser": s.parser is not None,
                 "telegram": None if tg is None else {"connected": tg.connected, "error": tg.error,
                                                      "user": (tg.me.username or tg.me.first_name) if tg.me else None}}
 
@@ -361,6 +461,69 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     def test_signal(body: TestParseIn, s=Depends(sigs)):
         return s.test_parse(body.text, body.channel_id)
 
+    @app.post("/api/signals/own", dependencies=[api])
+    def own_signal(body: OwnSignalIn, s=Depends(sigs)):
+        """A signal you type yourself, read like a channel message (the "My signals" channel)."""
+        if s.parser is None:
+            raise HTTPException(503, "Reading messages needs ANTHROPIC_API_KEY")
+        sig = s.own_signal(body.text)
+        if sig is None:
+            raise HTTPException(400, "The My signals channel is off")
+        return sig.to_dict()
+
+    # -- the signal agent (shadow mode): knowledge, lessons, questions
+
+    def agent_of(s):
+        if s.agent is None:
+            raise HTTPException(503, "The agent needs ANTHROPIC_API_KEY")
+        return s.agent
+
+    @app.get("/api/agent", dependencies=[api])
+    def agent_info(request: Request):
+        s = request.app.state.signals
+        if s is None or s.agent is None:
+            return {"available": False, "mode": "off", "knowledge": {"shared": [], "channels": {}}, "questions": []}
+        return {"available": True, "mode": s.cfg.agent_mode, "model": s.agent.model,
+                "knowledge": s.agent.knowledge.all(), "questions": s.agent_questions()}
+
+    @app.post("/api/agent/notes", dependencies=[api], status_code=201)
+    def add_note(body: NoteIn, s=Depends(sigs)):
+        try:
+            return agent_of(s).knowledge.add(body.scope, body.channel_id, body.text, "you")
+        except ValueError as ex:
+            raise HTTPException(400, str(ex))
+
+    @app.patch("/api/agent/notes/{note_id}", dependencies=[api])
+    def edit_note(note_id: int, body: NoteIn, s=Depends(sigs)):
+        if not agent_of(s).knowledge.update(note_id, body.text):
+            raise HTTPException(404, "Note not found")
+        return {"ok": True}
+
+    @app.delete("/api/agent/notes/{note_id}", dependencies=[api])
+    def delete_note(note_id: int, s=Depends(sigs)):
+        if not agent_of(s).knowledge.update(note_id, delete=True):
+            raise HTTPException(404, "Note not found")
+        return {"ok": True}
+
+    @app.post("/api/signals/{signal_id}/teach", dependencies=[api])
+    def teach_signal(signal_id: int, body: TeachIn, s=Depends(sigs)):
+        agent_of(s)
+        try:
+            r = s.teach(signal_id, body.text, body.scope)
+        except ValueError as ex:
+            raise HTTPException(400, str(ex))
+        return {k: v for k, v in (r or {}).items() if k != "inputs"}
+
+    @app.post("/api/signals/{signal_id}/answer", dependencies=[api])
+    def answer_signal(signal_id: int, body: TeachIn, s=Depends(sigs)):
+        agent_of(s)
+        r = s.answer(signal_id, body.text)
+        return {k: v for k, v in (r or {}).items() if k != "inputs"}
+
+    @app.get("/api/signals/{signal_id}/timeline", dependencies=[api])
+    def signal_timeline(signal_id: int, s=Depends(sigs)):
+        return s.timeline(signal_id)
+
     @app.post("/api/signals/{signal_id}/place", dependencies=[api])
     def place_signal(signal_id: int, body: PlaceIn | None = None, s=Depends(sigs)):
         return s.place(signal_id, body.lot if body else None).to_dict()
@@ -369,6 +532,21 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     def dismiss_signal(signal_id: int, s=Depends(sigs)):
         return s.dismiss(signal_id).to_dict()
 
+    @app.post("/api/feeds/{feed}/signals", dependencies=[api])
+    def feed_signal(feed: str, body: FeedSignalIn, s=Depends(sigs)):
+        """Another app (e.g. Market Watch) pushes a structured signal; it is handled as a channel."""
+        if not FEED_KEY.match(feed):
+            raise HTTPException(400, "Feed name: lowercase letters, digits, - and _ (max 40)")
+        if body.action not in ("open", "close", "close_partial", "move_sl", "modify_tp"):
+            raise HTTPException(400, "action must be open, close, close_partial, move_sl or modify_tp")
+        if body.action == "open" and body.side is None:
+            raise HTTPException(400, "An open signal needs a side")
+        sig = s.ingest(feed, body.id, body.action, side=body.side.value if body.side else None,
+                       entry=body.entry, sl=body.sl, tps=body.tps, close_pct=body.close_pct,
+                       move_sl_to=body.move_sl_to, note=body.note, title=body.title, confidence=body.confidence,
+                       reanchor=body.reanchor)
+        return {"status": "channel_off"} if sig is None else sig.to_dict()
+
     @app.get("/api/signals/settings", dependencies=[api])
     def signal_settings(s=Depends(sigs)):
         return s.cfg.to_dict()
@@ -376,23 +554,31 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     @app.put("/api/signals/settings", dependencies=[api])
     def set_signal_settings(body: SignalSettingsIn, s=Depends(sigs)):
         from signals import SignalSettings
-        return s.set_settings(SignalSettings(**body.model_dump())).to_dict()
+        try:
+            return s.set_settings(SignalSettings(**body.model_dump())).to_dict()
+        except ValueError as ex:
+            raise HTTPException(400, str(ex))
 
     @app.get("/api/channels", dependencies=[api])
     def channels(s=Depends(sigs)):
-        return [{**c.to_dict(), "review": s.channel_review(c.id)} for c in s.channels()]
+        from signals import is_feed
+        return [{**c.to_dict(), "feed": is_feed(c.id), "review": s.channel_review(c.id)} for c in s.channels()]
 
     @app.get("/api/channels/available", dependencies=[api])
-    def available_channels(s=Depends(sigs)):
+    def available_channels(refresh: bool = False, s=Depends(sigs)):
         if s.telegram is None or not s.telegram.connected:
-            return {"connected": False, "dialogs": []}
-        return {"connected": True, "dialogs": s.telegram.list_dialogs()}
+            return {"connected": False, "dialogs": [], "error": s.telegram.error if s.telegram else None}
+        dialogs, error = s.telegram.list_dialogs(refresh=refresh)
+        return {"connected": True, "dialogs": dialogs, "error": error}
 
     @app.get("/api/channels/{channel_id}/topics", dependencies=[api])
-    def channel_topics(channel_id: int, s=Depends(sigs)):
+    def channel_topics(channel_id: int, refresh: bool = False, s=Depends(sigs)):
         if s.telegram is None or not s.telegram.connected:
             return []
-        return s.telegram.list_topics(channel_id)
+        try:
+            return s.telegram.list_topics(channel_id, refresh=refresh)
+        except TimeoutError as ex:
+            raise HTTPException(504, str(ex))
 
     @app.put("/api/channels/{channel_id}", dependencies=[api])
     def save_channel(channel_id: int, body: ChannelIn, s=Depends(sigs)):
@@ -411,6 +597,54 @@ def create_app(service: TradingService | None = None, token: str | None = None, 
     @app.get("/api/channels/{channel_id}/review", dependencies=[api])
     def channel_review(channel_id: int, s=Depends(sigs)):
         return s.channel_review(channel_id)
+
+    # -- market watch
+
+    @app.get("/api/market", dependencies=[api])
+    def market_snapshot(tf: str = "4h", m=Depends(mkt)):
+        return m.snapshot(tf)
+
+    @app.get("/api/market/assets/{asset_id}", dependencies=[api])
+    def market_asset(asset_id: str, tf: str = "4h", m=Depends(mkt)):
+        a = next((a for a in m.snapshot(tf)["assets"] if a["id"] == asset_id), None)
+        if a is None:
+            raise HTTPException(404, "Asset not found")
+        return a
+
+    @app.post("/api/market/refresh", dependencies=[api])
+    def market_refresh(tf: str = "4h", m=Depends(mkt)):
+        out = m.refresh_now(tf)
+        if out["status"] == "rate_limited":
+            raise HTTPException(429, f"Refreshed a moment ago; try again in {out['retry_after']} s")
+        return out
+
+    @app.get("/api/market/calendar", dependencies=[api])
+    def market_calendar(hours: float = 48, m=Depends(mkt)):
+        from market import providers
+        return {"filter": {"enabled": m.cfg.news_filter, "before_min": m.cfg.news_before_min,
+                           "after_min": m.cfg.news_after_min, "impacts": m.cfg.news_impacts},
+                "upcoming": providers.upcoming(m.cfg, min(max(hours, 1), 168))}
+
+    @app.get("/api/market/feed", dependencies=[api])
+    def market_feed(m=Depends(mkt)):
+        return m.feed.status()
+
+    @app.get("/api/market/autotrade", dependencies=[api])
+    def market_autotrade(m=Depends(mkt)):
+        return {"autotrade": m.autotrader.status() if m.autotrader else {"enabled": False},
+                "sweepbos": m.sweepbos.status() if m.sweepbos else {"enabled": False}}
+
+    @app.get("/api/market/performance", dependencies=[api])
+    def market_performance(days: int = 7, strategy: str = "main", m=Depends(mkt)):
+        """Closed auto-trader (main) or Sweep+BOS trades on other symbols, from MT5 deal history."""
+        from market.autotrader import summarize_deals
+        mt = getattr(m.autotrader, "mt", None) or getattr(m.sweepbos, "mt", None)
+        if mt is None:
+            raise HTTPException(503, "Needs the MT5 broker and the auto-trader in mt5 mode")
+        days = max(1, min(days, 90))
+        magic = (m.sweepbos.cfg.magic if strategy == "sweepbos" and m.sweepbos
+                 else m.autotrader.cfg.magic if m.autotrader else 260731)
+        return summarize_deals(mt.deals(days, magic), days)
 
     # -- the app itself
 

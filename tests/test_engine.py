@@ -327,3 +327,49 @@ def test_retry_does_not_reclose_when_broker_filled_but_said_no():
     assert trade.steps[0].status is StepStatus.HIT and trade.steps[0].closed_volume == 0.02
     assert "P1 hit: closed 0.02" in ev[0].message
     assert len(broker.closing_deals(trade.ticket)) == 1
+
+
+# ------------------------------------------------- breakeven rule + hold time
+
+def _no_be_steps():
+    # P1 takes profit but leaves the stop alone; the breakeven rule decides when the stop moves.
+    return [StepConfig(20, 50, None), StepConfig(60, 25, 20), StepConfig(120, 0, 50)]
+
+
+def test_breakeven_rule_is_separate_from_p1():
+    eng, broker, clock = make()
+    s = TradeSettings(stop_mode=StopMode.MEDIUM, steps=_no_be_steps(), be_trigger_pips=40, be_lock_pips=5)
+    t, _ = eng.open_trade(Side.BUY, s)                    # entry 2650.30, SL 2645.30
+    walk(eng, broker, [2652.50])                          # +22: P1 closes half, stop stays
+    assert t.steps[0].status is StepStatus.HIT and t.sl == 2645.30
+    walk(eng, broker, [2651.00])                          # pullback to +7: still alive (old default would be out at BE)
+    assert broker.position(t.ticket) is not None
+    ev = walk(eng, broker, [2654.40])                     # +41: breakeven rule fires
+    assert t.be_done and t.sl == pytest.approx(2650.80)   # entry + 5 pips
+    assert any("Breakeven at +40" in e.message for e in ev)
+    walk(eng, broker, [2656.00])
+    assert t.sl == pytest.approx(2650.80)                 # fires once
+
+
+def test_hold_time_debounces_spikes():
+    eng, broker, clock = make()
+    s = TradeSettings(stop_mode=StopMode.MEDIUM, hold_seconds=10)
+    t, _ = eng.open_trade(Side.BUY, s)
+    walk(eng, broker, [2652.60])                          # +23: past P1 at +20 ...
+    clock.t += 5
+    walk(eng, broker, [2652.60])
+    assert t.steps[0].status is StepStatus.PENDING        # ... but only 5 s
+    walk(eng, broker, [2651.00])                          # spike over: the clock restarts
+    clock.t += 20
+    walk(eng, broker, [2652.60])
+    assert t.steps[0].status is StepStatus.PENDING
+    clock.t += 10
+    walk(eng, broker, [2652.60])                          # held 10 s
+    assert t.steps[0].status is StepStatus.HIT
+
+
+def test_breakeven_rule_validation():
+    assert validate(TradeSettings(be_trigger_pips=30, be_lock_pips=5), INFO)[0] == []
+    assert validate(TradeSettings(be_trigger_pips=5, be_lock_pips=5), INFO)[0]
+    assert validate(TradeSettings(be_trigger_pips=-1), INFO)[0]
+    assert validate(TradeSettings(hold_seconds=4000), INFO)[0]

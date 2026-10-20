@@ -1,9 +1,22 @@
 """Telegram signal channels, parsed signals and the trades planned from them."""
 from __future__ import annotations
 
+import zlib
 from dataclasses import asdict, dataclass, field
 
 MAX_WEIGHT = 5
+
+# Feeds are channels pushed to us over the API by another app (e.g. Market Watch) instead of
+# read from Telegram. Their ids sit far above any Telegram id so the two never collide.
+FEED_ID_BASE = 9_000_000_000_000
+
+
+def feed_channel_id(feed: str) -> int:
+    return FEED_ID_BASE + zlib.crc32(feed.encode())
+
+
+def is_feed(channel_id: int) -> bool:
+    return int(channel_id) >= FEED_ID_BASE
 
 
 @dataclass
@@ -46,6 +59,22 @@ class SignalSettings:
     max_entry_drift_pips: float = 30.0  # warn when market is further than this from the signal's entry
     default_sl_pips: float = 50.0   # stop used when the signal gives none (updated when a "stop X" message follows)
     model: str = "claude-opus-5"
+    # Sizing: "weight" = lot_per_weight x weight; "risk" = weight x risk_pct_per_weight % of the balance,
+    # lot worked out from the stop distance (so a wide stop trades smaller).
+    sizing: str = "weight"
+    risk_pct_per_weight: float = 0.25   # weight 1 risks 0.25% of the balance, weight 5 risks 1.25%
+    # A signal without a stop waits this long for the channel's "SL ..." message before entering.
+    wait_for_sl_s: float = 90.0         # 0 = enter at once with the default stop
+    no_sl_action: str = "default"       # when the wait runs out: default (use default_sl_pips) | skip
+    # Entry ladder: split the lot over up to 3 entries (zone edges, or deeper toward the stop).
+    ladder: bool = False
+    ladder_legs: int = 3
+    ladder_depth_pct: float = 50.0      # deepest leg sits this % of the way from the entry to the stop
+    ladder_expiry_min: float = 240.0    # unfilled entries are cancelled after this
+    # Breakeven armor: when the channel posts "TP1 hit", move the stop of its trades to breakeven.
+    be_on_tp_hit: bool = True
+    # The signal agent: off | shadow (reads every message and shows what it would do; nothing trades differently)
+    agent_mode: str = "off"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -66,6 +95,7 @@ class ParsedSignal:
     result: str | None = None       # for action "result": tp | sl | be | pips
     result_pips: float | None = None  # claimed outcome in pips (+ profit, - loss) when stated
     result_tp: int | None = None    # which TP was reported hit (1, 2, 3...)
+    order_type: str = "market"      # market | limit | stop (pending orders wait for their price)
     confidence: float = 0.0
     reason: str = ""
 
@@ -81,12 +111,16 @@ class Signal:
     msg_id: int
     text: str
     ts: float
-    status: str = "new"             # ignored | pending | placed | applied | failed | dismissed
+    # ignored | pending | placed | applied | failed | dismissed | result | watch
+    # waiting_sl (no stop yet) | armed (entries waiting for their price) | expired
+    status: str = "new"
     parsed: dict | None = None
     plan: dict | None = None        # the trade we would (or did) place / the edit we would apply
-    ticket: int | None = None
+    ticket: int | None = None       # the first (or only) trade
     error: str | None = None
     reply_to: int | None = None
+    tickets: list[int] = field(default_factory=list)   # every trade from this signal (ladder legs)
+    note: str | None = None         # what else happened, e.g. "SL to breakeven on #12"
 
     def to_dict(self) -> dict:
         return asdict(self)

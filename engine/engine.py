@@ -49,7 +49,9 @@ class Engine:
         self.clock = clock
         self.info = broker.symbol_info()
         self._trail_retry_at: dict[int, float] = {}
+        self._be_retry_at: dict[int, float] = {}
         self._history_waits: dict[int, int] = {}
+        self._reached: dict[tuple[int, object], float] = {}   # (ticket, step idx | "be") -> first time past the level
 
     # ------------------------------------------------------------------ opening
 
@@ -259,8 +261,11 @@ class Engine:
         for i, (cfg, st) in enumerate(zip(trade.settings.steps, trade.steps)):
             if st.status is not StepStatus.PENDING:
                 continue
-            if profit + _EPS < cfg.pips or now < st.next_attempt_at:
+            if profit + _EPS < cfg.pips:
+                self._reached.pop((trade.ticket, i), None)
                 break  # steps run strictly in order
+            if now < st.next_attempt_at or not self._held(trade, i, now):
+                break
             done, ev = self._run_step(trade, i, pos, q)
             events += ev
             if not done:
@@ -269,8 +274,42 @@ class Engine:
             if pos is None:
                 return events  # last step closed everything; tick() finalizes next pass
 
+        events += self._breakeven(trade, profit, q, now)
         events += self._trail(trade, profit, q)
         return events
+
+    def _held(self, trade: Trade, key, now: float) -> bool:
+        """True once profit has stayed past the level for the preset's hold time (debounce)."""
+        hold = trade.settings.hold_seconds
+        if hold <= 0:
+            return True
+        first = self._reached.setdefault((trade.ticket, key), now)
+        return now - first + _EPS >= hold
+
+    def _breakeven(self, trade: Trade, profit: float, q: Quote, now: float) -> list[Event]:
+        s = trade.settings
+        if s.be_trigger_pips is None or trade.be_done:
+            return []
+        if profit + _EPS < s.be_trigger_pips:
+            self._reached.pop((trade.ticket, "be"), None)
+            return []
+        if not self._held(trade, "be", now) or now < self._be_retry_at.get(trade.ticket, 0):
+            return []
+        new_sl = self._price_at(trade.entry, trade.side, s.be_lock_pips)
+        if not self._improves(trade, new_sl):
+            trade.be_done = True                      # a step or a manual move already locked more
+            self.store.save(trade)
+            return []
+        if not self._stop_ok(trade.side, new_sl, q, is_tp=False):
+            return []
+        r = self.broker.modify(trade.ticket, new_sl, trade.tp)
+        if not r.ok:
+            self._be_retry_at[trade.ticket] = now + self.cfg.retry_delay
+            return []
+        trade.sl, trade.be_done = new_sl, True
+        self.store.save(trade)
+        return [Event("sl_moved", trade.ticket, f"Breakeven at +{s.be_trigger_pips:g}: SL moved to "
+                                                f"{self._fmt(new_sl)} (+{s.be_lock_pips:g} pips)")]
 
     def _run_step(self, trade: Trade, i: int, pos: Position, q: Quote) -> tuple[bool, list[Event]]:
         cfg, st = trade.settings.steps[i], trade.steps[i]
@@ -365,6 +404,9 @@ class Engine:
                 return None
         self._history_waits.pop(trade.ticket, None)
         self._trail_retry_at.pop(trade.ticket, None)
+        self._be_retry_at.pop(trade.ticket, None)
+        for k in [k for k in self._reached if k[0] == trade.ticket]:
+            del self._reached[k]
 
         usd = round(sum(d.profit for d in deals), 2)
         pips = (sum((d.price - trade.entry) * trade.side.sign / PIP * d.volume for d in deals) / closed_vol
@@ -400,6 +442,8 @@ class Engine:
         """Highest profit level locked by the steps; trailing builds on it."""
         locks = [self._lock_pips(c.move_sl_pips) for c, st in zip(trade.settings.steps, trade.steps)
                  if st.status is StepStatus.HIT and c.move_sl_pips is not None]
+        if trade.be_done:
+            locks.append(trade.settings.be_lock_pips)
         if locks:
             return max(locks)
         return trade.settings.steps[2].pips - trade.settings.trail_pips
